@@ -5,6 +5,7 @@ Telegram-бот для розыгрышей (aiogram 3 + PostgreSQL).
   pip install aiogram "psycopg[binary,pool]" python-dotenv
 
 В .env или в системе нужен BOT_TOKEN.
+Опционально: START_WELCOME_PHOTO — путь к PNG главного экрана (абсолютный или относительно каталога скрипта; иначе ./start_welcome.png).
 
 Логика: участвовать может кто угодно; создавать и постить — только админы выбранного канала/группы;
 управлять конкретным розыгрышем может только тот, кто его создал.
@@ -44,6 +45,7 @@ from aiogram.types import (
     ChatMemberUpdated,
     ChatMemberOwner,
     ChatAdministratorRights,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -165,6 +167,22 @@ USERBOT_SESSION = os.environ.get("USERBOT_SESSION", "").strip()
 if not TOKEN:
     raise SystemExit("Задайте BOT_TOKEN в переменных окружения или .env")
 _database_url()  # ранняя проверка DATABASE_URL / POSTGRES_*
+
+
+def _start_welcome_photo_path() -> Path:
+    """Картинка главного экрана: START_WELCOME_PHOTO в окружении или start_welcome.png рядом со скриптом.
+
+    Относительный путь в переменной считается от каталога скрипта (не от cwd процесса).
+    """
+    base = Path(__file__).resolve().parent
+    custom = (os.environ.get("START_WELCOME_PHOTO") or "").strip()
+    if custom:
+        p = Path(custom).expanduser()
+        if not p.is_absolute():
+            p = base / p
+        return p.resolve()
+    return (base / "start_welcome.png").resolve()
+
 
 REF_PREFIX = "ref_"
 JOIN_PREFIX = "join_"
@@ -1799,8 +1817,17 @@ router = Router()
 
 
 def _main_menu_text() -> str:
-    """Текст над reply keyboard в личке."""
-    return "Что делаем? 👇"
+    """Текст главного экрана (подпись к фото) в личке."""
+    return (
+        "🎁 Добро пожаловать в AniGive!\n\n"
+        "AniGive - это удобный бот, созданный для проведения розыгрышей в каналах и чатах.\n\n"
+        "✨ Что умеет бот:\n"
+        "•Создание розыгрышей за пару кликов\n"
+        "• Честный и случайный выбор победителей\n"
+        "• Поддержка каналов и чатов\n"
+        "• Удобное управление и быстрый запуск\n"
+        "Запускайте розыгрыши, привлекайте аудиторию и радуйте своих подписчиков вместе с AniGive 🚀"
+    )
 
 
 async def _strip_reply_keyboard_in_chat(bot: Bot, chat_id: int) -> None:
@@ -1895,7 +1922,19 @@ def _main_menu_reply_kb() -> ReplyKeyboardMarkup:
 
 async def _send_fresh_main_menu_private(bot: Bot, chat_id: int, state: FSMContext) -> None:
     """Одно сообщение главного меню в личке (reply keyboard). Вызывать после state.clear()."""
-    sent = await bot.send_message(chat_id, _main_menu_text(), reply_markup=_main_menu_reply_kb())
+    kb = _main_menu_reply_kb()
+    text = _main_menu_text()
+    photo_path = _start_welcome_photo_path()
+    if photo_path.is_file():
+        sent = await bot.send_photo(
+            chat_id,
+            FSInputFile(photo_path),
+            caption=text,
+            reply_markup=kb,
+        )
+    else:
+        log.warning("welcome photo missing: %s", photo_path)
+        sent = await bot.send_message(chat_id, text, reply_markup=kb)
     await state.update_data(ui_chat_id=sent.chat.id, ui_message_id=sent.message_id)
 
 
