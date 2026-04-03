@@ -2194,7 +2194,9 @@ def _html_segment_to_text_and_bold_entities(seg: str) -> tuple[str, list[Message
         prefix = "".join(out)
         off = _utf16_len(prefix)
         out.append(bold_plain)
-        ents.append(MessageEntity(type="bold", offset=off, length=_utf16_len(bold_plain)))
+        ents.append(
+            MessageEntity(type=MessageEntityType.BOLD, offset=off, length=_utf16_len(bold_plain))
+        )
         i = d
     return "".join(out), ents
 
@@ -2228,7 +2230,7 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
         if eid:
             all_entities.append(
                 MessageEntity(
-                    type="custom_emoji",
+                    type=MessageEntityType.CUSTOM_EMOJI,
                     offset=base,
                     length=_utf16_len(glyph),
                     custom_emoji_id=eid,
@@ -2335,59 +2337,19 @@ def _outbound_caption_html(s: str) -> str:
 
 def _message_html_preserve_custom_emoji(message: Message) -> str:
     """
-    Prefer Telegram-provided html_text, but if custom emoji entities exist and
-    tg-emoji tags are missing, rebuild text with explicit <tg-emoji>.
+    HTML для сохранения в БД: только message.html_text (unparse текста+caption_entities).
+    Так aiogram гарантированно вставляет <tg-emoji> для custom_emoji из апдейта.
     """
-    html_text = ((getattr(message, "html_text", None) or "").strip()
-                 or (getattr(message, "html_caption", None) or "").strip())
-    html_text = _restore_escaped_tg_emoji_html(html_text)
-    entities = list(getattr(message, "entities", None) or []) + list(
-        getattr(message, "caption_entities", None) or []
-    )
-    plain = (message.text or message.caption or "")
+    plain = (message.text or message.caption or "").strip()
     if not plain:
-        return _restore_escaped_tg_emoji_html(html_text or html.escape(message.text or ""))
-    has_custom = any(_is_custom_emoji_entity(e) for e in entities)
-    if not has_custom:
-        if "<tg-emoji" in html_text:
-            return html_text
-        return _restore_escaped_tg_emoji_html(html_text or html.escape(plain))
-    if "<tg-emoji" in html_text:
-        # aiogram unparse уже дал теги + форматирование (<b> и т.д.)
-        return html_text
-
-    # Entities с custom_emoji есть, а в html_text не развернулись теги — собираем из plain.
-    out = html.escape(plain, quote=False)
-    custom_entities: list[tuple[int, int, str]] = []
-    for e in entities:
-        if not _is_custom_emoji_entity(e):
-            continue
-        cid = str(getattr(e, "custom_emoji_id", "") or "").strip()
-        if not cid:
-            continue
-        off = int(getattr(e, "offset", 0) or 0)
-        ln = int(getattr(e, "length", 0) or 0)
-        if ln <= 0:
-            continue
-        s = _utf16_offset_to_py_index(plain, off)
-        t = _utf16_offset_to_py_index(plain, off + ln)
-        custom_entities.append((s, t, cid))
-    if not custom_entities:
-        if "<tg-emoji" in html_text:
-            return html_text
-        return html_text or out
-
-    parts: list[str] = []
-    cursor = 0
-    for s, t, cid in sorted(custom_entities, key=lambda x: x[0]):
-        if s < cursor:
-            continue
-        parts.append(html.escape(plain[cursor:s], quote=False))
-        glyph = plain[s:t] or "•"
-        parts.append(f'<tg-emoji emoji-id="{cid}">{html.escape(glyph, quote=False)}</tg-emoji>')
-        cursor = t
-    parts.append(html.escape(plain[cursor:], quote=False))
-    return _restore_escaped_tg_emoji_html("".join(parts))
+        return ""
+    try:
+        ht = (message.html_text or "").strip()
+    except Exception:
+        ht = ""
+    if not ht:
+        return html.escape(message.text or message.caption or "", quote=False)
+    return _restore_escaped_tg_emoji_html(ht)
 
 
 async def _dispatch_crosspost_admin_requests(
@@ -7541,11 +7503,14 @@ async def _send_via_userbot_if_possible(
             bio.seek(0)
             ext = ".jpg" if kind == "photo" else ".mp4" if kind == "video" else ".gif"
             bio.name = f"giveaway{ext}"
+            # parse_mode=None: иначе при пустом/отсутствии entities Telethon снова парсит caption
+            # дефолтным HTML и ломает премиум-эмодзи (plain текст без сущностей).
             sm = await ub.send_file(
                 target,
                 bio,
                 caption=cap_text,
-                formatting_entities=tl_entities or None,
+                formatting_entities=tl_entities,
+                parse_mode=None,
                 link_preview=False,
                 buttons=tl_buttons,
             )
@@ -7554,7 +7519,8 @@ async def _send_via_userbot_if_possible(
                 sm = await ub.send_message(
                     target,
                     cap_text,
-                    formatting_entities=tl_entities or None,
+                    formatting_entities=tl_entities,
+                    parse_mode=None,
                     link_preview=False,
                     buttons=tl_buttons,
                 )
@@ -7564,7 +7530,8 @@ async def _send_via_userbot_if_possible(
                 sm = await ub.send_message(
                     target,
                     cap_text,
-                    formatting_entities=tl_entities or None,
+                    formatting_entities=tl_entities,
+                    parse_mode=None,
                     link_preview=False,
                 )
         return {"chat_id": int(publish_cid), "message_id": int(sm.id)}
