@@ -133,23 +133,39 @@ class _PgCursorShim:
 
 class PgConnAdapter:
     # Shim aiosqlite: ? -> %s, fetch*, commit.
+    # Закрываем предыдущий курсор перед новым execute: иначе на одном соединении
+    # накапливаются порталы и ломаются цепочки SELECT → много DELETE (purge) / RETURNING.
 
-    __slots__ = ("_conn", "row_factory")
+    __slots__ = ("_conn", "row_factory", "_cur")
 
     def __init__(self, conn):
         self._conn = conn
         self.row_factory = None
+        self._cur = None
+
+    async def _discard_cursor(self) -> None:
+        c = self._cur
+        self._cur = None
+        if c is None:
+            return
+        try:
+            await c.close()
+        except Exception:
+            pass
 
     async def execute(self, sql: str, params=None):
+        await self._discard_cursor()
         if params is None:
             params = ()
         sql_pg = sql.replace("?", "%s")
         cur = self._conn.cursor(row_factory=dict_row)
         await cur.execute(sql_pg, params)
+        self._cur = cur
         shim = _PgCursorShim(cur)
         return shim
 
     async def commit(self):
+        await self._discard_cursor()
         await self._conn.commit()
 
 
@@ -157,7 +173,11 @@ class PgConnAdapter:
 async def _pg_conn():
     pool = await _get_pool()
     async with pool.connection() as raw:
-        yield PgConnAdapter(raw)
+        db = PgConnAdapter(raw)
+        try:
+            yield db
+        finally:
+            await db._discard_cursor()
 
 
 
@@ -643,10 +663,6 @@ async def get_giveaway(db: PgConnAdapter, gid: int) -> Optional[dict[str, Any]]:
 
 async def purge_giveaway_from_db(db: PgConnAdapter, gid: int) -> None:
     await _crosspost_pending_delete_for_giveaway_db(db, gid)
-    # На случай FK/остатков ссылок в схеме, отличной от DDL в этом файле.
-    await db.execute(
-        "UPDATE crosspost_pending SET giveaway_id = NULL WHERE giveaway_id = ?", (gid,)
-    )
     await db.execute("DELETE FROM lottery_picks WHERE giveaway_id = ?", (gid,))
     await db.execute("DELETE FROM valid_referrals WHERE giveaway_id = ?", (gid,))
     await db.execute("DELETE FROM referral_queue WHERE giveaway_id = ?", (gid,))
@@ -2952,8 +2968,12 @@ async def _render_draft_giveaway_screen(
     query: CallbackQuery,
     state: FSMContext,
     bot: Bot,
-    g: dict[str, Any],
+    g: Optional[dict[str, Any]],
 ) -> None:
+    if not g:
+        log.error("render draft screen: giveaway not in DB")
+        await query.answer("Черновик не найден в базе.", show_alert=True)
+        return
     await query.answer()
     cid, mid = query.message.chat.id, query.message.message_id
     try:
@@ -2971,8 +2991,18 @@ async def _present_draft_giveaway_after_wizard(
     state: FSMContext,
     chat_id: int,
     old_message_id: Optional[int],
-    g: dict[str, Any],
+    g: Optional[dict[str, Any]],
 ) -> None:
+    if not g:
+        log.error("present draft after wizard: giveaway not in DB")
+        try:
+            await bot.send_message(
+                chat_id,
+                "⚠️ Черновик записался некорректно. Нажми «Создать розыгрыш» ещё раз; если повторится — смотри лог сервера.",
+            )
+        except Exception as e:
+            log.debug("present draft fallback msg: %s", e)
+        return
     if old_message_id is not None:
         try:
             await bot.delete_message(chat_id, int(old_message_id))
@@ -3038,8 +3068,23 @@ async def _insert_draft_giveaway_row(
             ),
         )
         row_id = await cur.fetchone()
+        rid: int | None = None
+        if row_id is not None:
+            try:
+                rid = int(row_id["id"])
+            except (KeyError, TypeError, ValueError):
+                rid = None
+        if rid is None:
+            cur2 = await db.execute(
+                "SELECT id FROM giveaways WHERE created_by = ? ORDER BY id DESC LIMIT 1",
+                (uid,),
+            )
+            row_fb = await cur2.fetchone()
+            if row_fb is None:
+                raise RuntimeError("INSERT giveaways did not return id")
+            rid = int(row_fb["id"])
         await db.commit()
-        return int(row_id["id"])
+        return rid
 
 
 def _draft_extra_kb(g: dict[str, Any]) -> InlineKeyboardMarkup:
