@@ -36,7 +36,7 @@ from typing import Any, Optional
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatType
+from aiogram.enums import ChatType, MessageEntityType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -2107,6 +2107,12 @@ def _extract_custom_emoji_id_from_message(message: Message) -> Optional[str]:
 
 
 def _is_custom_emoji_entity(ent: Any) -> bool:
+    t = getattr(ent, "type", None)
+    try:
+        if t == MessageEntityType.CUSTOM_EMOJI:
+            return True
+    except Exception:
+        pass
     et = str(getattr(ent, "type", "") or "").strip().lower()
     compact = re.sub(r"[^a-z]", "", et)
     # Covers: custom_emoji, customEmoji, MessageEntityType.CUSTOM_EMOJI, etc.
@@ -2204,7 +2210,7 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
         r'<tg-emoji\s+emoji-id=["\'](\d+)["\']\s*>(.*?)</tg-emoji>',
         flags=re.IGNORECASE | re.DOTALL,
     )
-    src = src_html or ""
+    src = _restore_escaped_tg_emoji_html(src_html or "")
     pos = 0
     for m in pat.finditer(src):
         seg = src[pos:m.start()]
@@ -2241,6 +2247,47 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
     return text, all_entities
 
 
+def _aiogram_entities_to_telethon(entities: list[MessageEntity]) -> list[Any]:
+    """Сущности aiogram → Telethon (userbot), UTF-16 offsets как в Bot API."""
+    if TelegramClient is None or not entities:
+        return []
+    from telethon.tl.types import MessageEntityBold, MessageEntityCustomEmoji
+
+    out: list[Any] = []
+    for e in sorted(entities, key=lambda x: int(getattr(x, "offset", 0) or 0)):
+        off = int(getattr(e, "offset", 0) or 0)
+        ln = int(getattr(e, "length", 0) or 0)
+        if ln <= 0:
+            continue
+        t = getattr(e, "type", None)
+        if t == MessageEntityType.BOLD:
+            out.append(MessageEntityBold(offset=off, length=ln))
+            continue
+        if t == MessageEntityType.CUSTOM_EMOJI:
+            cid = getattr(e, "custom_emoji_id", None)
+            if cid is None:
+                continue
+            try:
+                doc_id = int(str(cid).strip())
+            except ValueError:
+                continue
+            out.append(MessageEntityCustomEmoji(offset=off, length=ln, document_id=doc_id))
+            continue
+        ts = str(t or "").lower()
+        if ts == "bold":
+            out.append(MessageEntityBold(offset=off, length=ln))
+        elif ts == "custom_emoji":
+            cid = getattr(e, "custom_emoji_id", None)
+            if cid is None:
+                continue
+            try:
+                doc_id = int(str(cid).strip())
+            except ValueError:
+                continue
+            out.append(MessageEntityCustomEmoji(offset=off, length=ln, document_id=doc_id))
+    return out
+
+
 def _restore_escaped_tg_emoji_html(src: str) -> str:
     """
     Some legacy rows may store tg-emoji tags escaped as text.
@@ -2261,9 +2308,15 @@ def _restore_escaped_tg_emoji_html(src: str) -> str:
         s,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    # Как в html_text клиента Telegram:
+    # Как в html_text клиента / разные варианты разметки:
     s = re.sub(
-        r'<emoji\s+id="(\d+)"\s*>(.*?)</emoji>',
+        r"<emoji\s+id=(['\"])(\d+)\1\s*>(.*?)</emoji>",
+        r'<tg-emoji emoji-id="\2">\3</tg-emoji>',
+        s,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    s = re.sub(
+        r"<emoji\s+id=(\d+)\s*>(.*?)</emoji>",
         r'<tg-emoji emoji-id="\1">\2</tg-emoji>',
         s,
         flags=re.IGNORECASE | re.DOTALL,
@@ -2306,15 +2359,7 @@ def _message_html_preserve_custom_emoji(message: Message) -> str:
     """
     html_text = ((getattr(message, "html_text", None) or "").strip()
                  or (getattr(message, "html_caption", None) or "").strip())
-    if html_text and "<emoji id=" in html_text:
-        # aiogram/Telegram may provide custom emoji as <emoji id="...">X</emoji>;
-        # Bot API HTML for sending requires <tg-emoji emoji-id="...">X</tg-emoji>.
-        html_text = re.sub(
-            r'<emoji id="(\d+)">(.*?)</emoji>',
-            r'<tg-emoji emoji-id="\1">\2</tg-emoji>',
-            html_text,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
+    html_text = _restore_escaped_tg_emoji_html(html_text)
     entities = list(getattr(message, "entities", None) or []) + list(
         getattr(message, "caption_entities", None) or []
     )
@@ -2323,6 +2368,8 @@ def _message_html_preserve_custom_emoji(message: Message) -> str:
         return _restore_escaped_tg_emoji_html(html_text or html.escape(message.text or ""))
     has_custom = any(_is_custom_emoji_entity(e) for e in entities)
     if not has_custom:
+        if "<tg-emoji" in html_text:
+            return html_text
         return _restore_escaped_tg_emoji_html(html_text or html.escape(plain))
     if "<tg-emoji" in html_text:
         return html_text
@@ -7436,6 +7483,8 @@ async def _send_via_userbot_if_possible(
     if getattr(ch, "type", "") != "channel":
         return None
     card = _giveaway_public_caption(g)
+    cap_text, cap_entities = _html_to_text_and_custom_entities(card)
+    tl_entities = _aiogram_entities_to_telethon(cap_entities)
     kind = (g.get("post_media_kind") or "").strip()
     fid = (g.get("post_media_file_id") or "").strip()
     join_url: Optional[str] = None
@@ -7512,8 +7561,8 @@ async def _send_via_userbot_if_possible(
             sm = await ub.send_file(
                 target,
                 bio,
-                caption=card,
-                parse_mode="html",
+                caption=cap_text,
+                formatting_entities=tl_entities or None,
                 link_preview=False,
                 buttons=tl_buttons,
             )
@@ -7521,15 +7570,20 @@ async def _send_via_userbot_if_possible(
             try:
                 sm = await ub.send_message(
                     target,
-                    card,
-                    parse_mode="html",
+                    cap_text,
+                    formatting_entities=tl_entities or None,
                     link_preview=False,
                     buttons=tl_buttons,
                 )
             except Exception as e_btn:
                 # Some channels/accounts may reject user buttons; retry without buttons.
                 log.warning("userbot send with inline button failed for %s: %s", publish_cid, e_btn)
-                sm = await ub.send_message(target, card, parse_mode="html", link_preview=False)
+                sm = await ub.send_message(
+                    target,
+                    cap_text,
+                    formatting_entities=tl_entities or None,
+                    link_preview=False,
+                )
         return {"chat_id": int(publish_cid), "message_id": int(sm.id)}
     except Exception as e:
         log.warning("userbot send failed for %s: %s", publish_cid, e)
