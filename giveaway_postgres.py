@@ -686,17 +686,23 @@ async def _crosspost_pending_delete_for_giveaway_db(
     db: PgConnAdapter, giveaway_id: int
 ) -> None:
     """Удаляет все pending по розыгрышу; без commit (вызывающий делает commit)."""
-    cur = await db.execute(
-        "SELECT id FROM crosspost_pending WHERE giveaway_id = ?", (giveaway_id,)
+    gid = int(giveaway_id)
+    await db.execute(
+        "DELETE FROM crosspost_vote WHERE pending_id IN "
+        "(SELECT id FROM crosspost_pending WHERE giveaway_id = ?)",
+        (gid,),
     )
-    ids = [int(r["id"]) for r in await cur.fetchall()]
-    for pid in ids:
-        await db.execute("DELETE FROM crosspost_vote WHERE pending_id = ?", (pid,))
-        await db.execute("DELETE FROM crosspost_notif WHERE pending_id = ?", (pid,))
-        await db.execute(
-            "DELETE FROM crosspost_creator_notified WHERE pending_id = ?", (pid,)
-        )
-        await db.execute("DELETE FROM crosspost_pending WHERE id = ?", (pid,))
+    await db.execute(
+        "DELETE FROM crosspost_notif WHERE pending_id IN "
+        "(SELECT id FROM crosspost_pending WHERE giveaway_id = ?)",
+        (gid,),
+    )
+    await db.execute(
+        "DELETE FROM crosspost_creator_notified WHERE pending_id IN "
+        "(SELECT id FROM crosspost_pending WHERE giveaway_id = ?)",
+        (gid,),
+    )
+    await db.execute("DELETE FROM crosspost_pending WHERE giveaway_id = ?", (gid,))
 
 
 async def _crosspost_approved_extra_chat_ids(
@@ -2574,11 +2580,34 @@ def _kb_back_to_giveaway(gid: int) -> InlineKeyboardMarkup:
     )
 
 
+def _user_stored_html_as_safe_plain_escape(
+    raw: str, *, max_len: int = 900
+) -> str:
+    """Из БД (title/description как Telegram HTML) — плоский текст + html.escape для вставки в наши HTML-экраны.
+    Иначе битые <tg-emoji> в названии ломают edit_message и блокируют удаление и др. действия."""
+    plain = _html_to_plain_text_keep_linebreaks(
+        _restore_escaped_tg_emoji_html((raw or "").strip())
+    ).strip()
+    if len(plain) > max_len:
+        plain = plain[: max_len - 1] + "…"
+    return html.escape(plain)
+
+
+def _giveaway_title_button_caption(g: dict[str, Any]) -> str:
+    """Одна строка для текста кнопки без HTML-тегов из названия."""
+    t = _html_to_plain_text_keep_linebreaks(
+        _restore_escaped_tg_emoji_html((g.get("title") or "").strip())
+    ).replace("\n", " ").strip()
+    return t
+
+
 def _giveaway_user_text(g: dict[str, Any]) -> str:
     ch = _giveaway_conditions_channels_html(g)
+    title_esc = _user_stored_html_as_safe_plain_escape(g.get("title") or "", max_len=400)
+    desc_esc = _user_stored_html_as_safe_plain_escape(g.get("description") or "", max_len=1200)
     return (
-        f"<b>{g['title']}</b>\n\n"
-        f"{g['description']}\n\n"
+        f"<b>{title_esc}</b>\n\n"
+        f"{desc_esc}\n\n"
         f"{ch}"
         f"🏆 Победителей: {g['winners_count']}\n"
         f"⏳ Принимаем заявки до: {_format_ends_at_user(g['ends_at'])} (по Москве)"
@@ -3709,7 +3738,7 @@ def _kb_back_admin_giveaway(gid: int) -> InlineKeyboardMarkup:
 def _list_giveaways_kb(items: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for g in items[:20]:
-        t = g["title"].replace("\n", " ")
+        t = _giveaway_title_button_caption(g)
         if len(t) > 36:
             t = t[:35] + "…"
         rows.append([InlineKeyboardButton(text=f"🎁 {t}", callback_data=f"g:{g['id']}")])
@@ -3720,7 +3749,7 @@ def _list_giveaways_kb(items: list[dict[str, Any]]) -> InlineKeyboardMarkup:
 def _adm_list_kb(items: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for g in items[:20]:
-        t = g["title"].replace("\n", " ")
+        t = _giveaway_title_button_caption(g)
         if len(t) > 22:
             t = t[:21] + "…"
         st = g.get("status")
@@ -3806,7 +3835,7 @@ def _my_own_items_kb(items: list[dict[str, Any]], active_tab: str, page: int = 1
     )
     cur_page, total_pages, start = _page_bounds(len(items), page)
     for g in items[start:start + _MY_PAGE_SIZE]:
-        t = g["title"].replace("\n", " ")
+        t = _giveaway_title_button_caption(g)
         if len(t) > 30:
             t = t[:29] + "…"
         st = g.get("status")
@@ -3823,7 +3852,7 @@ def _my_joined_items_kb(joined_items: list[dict[str, Any]], page: int = 1) -> In
     cur_page, total_pages, start = _page_bounds(len(joined_items), page)
     for g in joined_items[start:start + _MY_PAGE_SIZE]:
         gid = int(g["id"])
-        t = g["title"].replace("\n", " ")
+        t = _giveaway_title_button_caption(g)
         if len(t) > 30:
             t = t[:29] + "…"
         st = g.get("status")
@@ -4387,9 +4416,10 @@ async def cb_admin_giveaway_open(query: CallbackQuery, state: FSMContext, bot: B
         return
     st = g["status"]
     st_ru = "идёт приём участников" if st == "active" else "уже завершён" if st == "finished" else st
+    title_show = _user_stored_html_as_safe_plain_escape(g.get("title") or "", max_len=400)
     text = (
         f"🛠 <b>Розыгрыш #{gid}</b>\n"
-        f"{g['title']}\n\n"
+        f"{title_show}\n\n"
         f"⏳ До: {_format_ends_at_user(g['ends_at'])} (МСК)\n"
         f"Сейчас: {st_ru}\n\n"
         "<i>Это меню видишь только ты — ты автор.</i>"
@@ -4491,12 +4521,13 @@ async def cb_delete_ask(query: CallbackQuery, state: FSMContext, bot: Bot) -> No
     if not _is_giveaway_owner(g, uid):
         await query.answer("Это чужой розыгрыш", show_alert=True)
         return
+    title_show = _user_stored_html_as_safe_plain_escape(g.get("title") or "", max_len=400)
     await _render_callback_screen(
         query,
         state,
         bot,
         f"{_tg_pe(_PE_DRAFT_DELETE, '🗑')} <b>Удалить розыгрыш #{gid}?</b>\n\n"
-        f"{g['title']}\n\n"
+        f"{title_show}\n\n"
         "Все участники и настройки пропадут из бота безвозвратно. "
         "Пост в канале или группе бот постарается удалить — если у него хватит прав.",
         _delete_confirm_kb(gid),
@@ -4558,13 +4589,22 @@ async def cb_delete_yes(query: CallbackQuery, state: FSMContext, bot: Bot) -> No
             [InlineKeyboardButton(text="📂 К списку моих розыгрышей", callback_data="adm_list")],
         ]
     )
-    await _render_callback_screen(
-        query,
-        state,
-        bot,
-        f"✅ Розыгрыш <b>#{gid}</b> удалён.\n\nДругие люди и раньше не могли им управлять — только ты.",
-        kb,
+    ok_text = (
+        f"✅ Розыгрыш <b>#{gid}</b> удалён.\n\n"
+        "Другие люди и раньше не могли им управлять — только ты."
     )
+    try:
+        await _render_callback_screen(query, state, bot, ok_text, kb)
+    except TelegramBadRequest as e:
+        log.warning("post-delete UI edit/send failed (row already purged): %s", e)
+        try:
+            await bot.send_message(
+                query.message.chat.id,
+                "✅ Розыгрыш удалён из базы. Нажми «Мои розыгрыши» в меню.",
+                reply_markup=kb,
+            )
+        except Exception as send_ex:
+            log.debug("post-delete plain notify: %s", send_ex)
 
 
 @router.callback_query(F.data.startswith("reflink:"))
