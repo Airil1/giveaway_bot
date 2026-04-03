@@ -2294,29 +2294,53 @@ def _strip_all_tg_emoji_for_send(html: str) -> str:
     return s
 
 
-async def _send_html_with_emoji_fallback(
-    card: str,
-    send: Any,
-) -> Message:
-    """send(c: str) -> Message: HTML; при ошибке разбора сущностей/emoji — без <tg-emoji>."""
-    stripped = _strip_all_tg_emoji_for_send(card)
-    try:
-        return await send(card)
-    except TelegramBadRequest as e:
-        err = (str(e) or "").lower()
-        if stripped != card and any(
-            x in err
-            for x in (
-                "custom emoji",
-                "entities",
-                "parse",
-                "can't parse",
-                "cannot parse",
-            )
-        ):
-            log.warning("send HTML failed (%s), retry without tg-emoji", e)
-            return await send(stripped)
-        raise
+def _is_tg_parse_or_custom_emoji_error(exc: BaseException) -> bool:
+    msg = (str(exc) or "").lower()
+    return any(
+        x in msg
+        for x in (
+            "custom emoji",
+            "entities",
+            "parse",
+            "can't parse",
+            "cannot parse",
+        )
+    )
+
+
+def _inline_button_without_custom_emoji_icon(b: InlineKeyboardButton) -> InlineKeyboardButton:
+    """Новая кнопка с тем же действием, без icon_custom_emoji_id (model_dump на разных aiogram может не выкинуть поле)."""
+    args: dict[str, Any] = {"text": b.text or "·"}
+    if b.url:
+        args["url"] = b.url
+    elif b.callback_data is not None:
+        args["callback_data"] = b.callback_data
+    if b.web_app is not None:
+        args["web_app"] = b.web_app
+    if b.login_url is not None:
+        args["login_url"] = b.login_url
+    if b.switch_inline_query is not None:
+        args["switch_inline_query"] = b.switch_inline_query
+    if b.switch_inline_query_current_chat is not None:
+        args["switch_inline_query_current_chat"] = b.switch_inline_query_current_chat
+    if b.switch_inline_query_chosen_chat is not None:
+        args["switch_inline_query_chosen_chat"] = b.switch_inline_query_chosen_chat
+    ct = getattr(b, "copy_text", None)
+    if ct is not None:
+        args["copy_text"] = ct
+    cg = getattr(b, "callback_game", None)
+    if cg is not None:
+        args["callback_game"] = cg
+    if getattr(b, "pay", False):
+        args["pay"] = True
+    return InlineKeyboardButton(**args)
+
+
+def _strip_inline_kb_custom_emoji(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [_inline_button_without_custom_emoji_icon(b) for b in row] for row in kb.inline_keyboard
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _message_html_preserve_custom_emoji(message: Message) -> str:
@@ -3019,40 +3043,62 @@ async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, A
     """Сообщение как в канале (подпись/медиа), но с клавиатурой управления черновиком."""
     card = _giveaway_public_caption(g)
     kb = _draft_lottery_kb(int(g["id"])) if _is_lottery(g) else _draft_giveaway_kb(int(g["id"]))
+    card_no_pe = _strip_all_tg_emoji_for_send(card)
+    kb_no_pe = _strip_inline_kb_custom_emoji(kb)
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
-    if kind == "photo" and fid:
-        return await _send_html_with_emoji_fallback(
-            card,
-            lambda c: bot.send_photo(
-                chat_id, fid, caption=c, reply_markup=kb, parse_mode="HTML"
-            ),
-        )
-    if kind == "animation" and fid:
-        return await _send_html_with_emoji_fallback(
-            card,
-            lambda c: bot.send_animation(
-                chat_id, fid, caption=c, reply_markup=kb, parse_mode="HTML"
-            ),
-        )
-    if kind == "video" and fid:
-        return await _send_html_with_emoji_fallback(
-            card,
-            lambda c: bot.send_video(
-                chat_id, fid, caption=c, reply_markup=kb, parse_mode="HTML"
-            ),
-        )
-    return await _send_html_with_emoji_fallback(
-        card,
-        lambda c: bot.send_message(
+
+    async def _send(caption: str, markup: InlineKeyboardMarkup, *, parse_mode: Optional[str]) -> Message:
+        if kind == "photo" and fid:
+            return await bot.send_photo(
+                chat_id,
+                fid,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode=parse_mode,
+            )
+        if kind == "animation" and fid:
+            return await bot.send_animation(
+                chat_id,
+                fid,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode=parse_mode,
+            )
+        if kind == "video" and fid:
+            return await bot.send_video(
+                chat_id,
+                fid,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode=parse_mode,
+            )
+        return await bot.send_message(
             chat_id,
-            c,
-            reply_markup=kb,
-            parse_mode="HTML",
+            caption,
+            reply_markup=markup,
+            parse_mode=parse_mode,
             disable_web_page_preview=True,
             link_preview_options=_LINK_PREVIEW_OFF,
-        ),
-    )
+        )
+
+    try:
+        return await _send(card, kb, parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if not _is_tg_parse_or_custom_emoji_error(e):
+            raise
+        log.warning(
+            "draft UI: HTML/custom emoji rejected (%s); retry without tg-emoji in text and on buttons",
+            e,
+        )
+        try:
+            return await _send(card_no_pe, kb_no_pe, parse_mode="HTML")
+        except TelegramBadRequest as e2:
+            if not _is_tg_parse_or_custom_emoji_error(e2):
+                raise
+            log.warning("draft UI: retry plain caption + no parse_mode: %s", e2)
+            plain = html.escape(_html_to_plain_text_keep_linebreaks(card_no_pe))
+            return await _send(plain, kb_no_pe, parse_mode=None)
 
 
 async def _render_draft_giveaway_screen(
