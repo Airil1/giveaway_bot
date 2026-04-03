@@ -6,6 +6,7 @@ Telegram-бот для розыгрышей (aiogram 3 + PostgreSQL).
 
 В .env или в системе нужен BOT_TOKEN.
 Опционально: START_WELCOME_PHOTO — путь к PNG главного экрана (абсолютный или относительно каталога скрипта; иначе ./start_welcome.png).
+Опционально: PREMIUM_CUSTOM_EMOJI_UI=1 — включить premium emoji в кнопках (id из кода должны быть доступны вашему боту; иначе Telegram: Invalid custom emoji identifier).
 
 Логика: участвовать может кто угодно; создавать и постить — только админы выбранного канала/группы;
 управлять конкретным розыгрышем может только тот, кто его создал.
@@ -239,32 +240,51 @@ _PE_REF_CONFIRMED = "5891207662678317861"
 _PE_REF_NEXT = "6041685260687642937"
 
 
+def _premium_custom_emoji_ui_enabled() -> bool:
+    """Premium custom emoji в кнопках: только при явном включении (id в коде — для того бота, у кого набор разрешён)."""
+    return (os.environ.get("PREMIUM_CUSTOM_EMOJI_UI") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _pe_icon(custom_emoji_id: Optional[str]) -> dict[str, Any]:
+    if not _premium_custom_emoji_ui_enabled():
+        return {}
+    e = (str(custom_emoji_id) if custom_emoji_id is not None else "").strip()
+    if not e:
+        return {}
+    return {"icon_custom_emoji_id": e}
+
+
 def _ikb_back(callback_data: str) -> InlineKeyboardButton:
     """Кнопка назад: premium emoji + текст."""
     return InlineKeyboardButton(
         text="Назад",
         callback_data=callback_data,
-        icon_custom_emoji_id=_PE_BACK_BTN,
+        **_pe_icon(_PE_BACK_BTN),
     )
 
 
 def _reply_btn_my_giveaways() -> KeyboardButton:
-    return KeyboardButton(text="Мои розыгрыши", icon_custom_emoji_id=_PE_MENU_MY_GIVEAWAYS)
+    return KeyboardButton(text="Мои розыгрыши", **_pe_icon(_PE_MENU_MY_GIVEAWAYS))
 
 
 def _reply_btn_create_giveaway() -> KeyboardButton:
-    return KeyboardButton(text="Создать розыгрыш", icon_custom_emoji_id=_PE_MENU_CREATE_GIVEAWAY)
+    return KeyboardButton(text="Создать розыгрыш", **_pe_icon(_PE_MENU_CREATE_GIVEAWAY))
 
 
 def _reply_btn_saved_channels() -> KeyboardButton:
-    return KeyboardButton(text="Сохранёные каналы", icon_custom_emoji_id=_PE_MENU_SAVED_CHANNELS)
+    return KeyboardButton(text="Сохранёные каналы", **_pe_icon(_PE_MENU_SAVED_CHANNELS))
 
 
 def _ikb_menu_my() -> InlineKeyboardButton:
     return InlineKeyboardButton(
         text="Мои розыгрыши",
         callback_data="menu:my",
-        icon_custom_emoji_id=_PE_MENU_MY_GIVEAWAYS,
+        **_pe_icon(_PE_MENU_MY_GIVEAWAYS),
     )
 
 
@@ -272,7 +292,7 @@ def _ikb_menu_create() -> InlineKeyboardButton:
     return InlineKeyboardButton(
         text="Создать розыгрыш",
         callback_data="adm_new",
-        icon_custom_emoji_id=_PE_MENU_CREATE_GIVEAWAY,
+        **_pe_icon(_PE_MENU_CREATE_GIVEAWAY),
     )
 
 
@@ -280,7 +300,7 @@ def _ikb_menu_saved_channels() -> InlineKeyboardButton:
     return InlineKeyboardButton(
         text="Сохранёные каналы",
         callback_data="menu:saved_chats",
-        icon_custom_emoji_id=_PE_MENU_SAVED_CHANNELS,
+        **_pe_icon(_PE_MENU_SAVED_CHANNELS),
     )
 
 
@@ -288,7 +308,7 @@ def _ikb_menu_own() -> InlineKeyboardButton:
     return InlineKeyboardButton(
         text="Созданные тобой",
         callback_data="my:own",
-        icon_custom_emoji_id=_PE_MY_OWN,
+        **_pe_icon(_PE_MY_OWN),
     )
 
 
@@ -1202,7 +1222,7 @@ async def _saved_chats_list_body_and_keyboard(
                 InlineKeyboardButton(
                     text=text,
                     callback_data=f"delsc:{int(s['chat_id'])}",
-                    icon_custom_emoji_id=_saved_chat_pick_icon_id(s),
+                    **_pe_icon(_saved_chat_pick_icon_id(s)),
                 )
             ]
         )
@@ -1325,12 +1345,12 @@ async def _publish_pick_invite_rows(bot: Bot) -> list[list[InlineKeyboardButton]
                 InlineKeyboardButton(
                     text="Добавить канал",
                     url=f"{base}?startchannel=add&admin={_DL_ADMIN_CH}",
-                    icon_custom_emoji_id=_PE_SAVED_CHANNEL,
+                    **_pe_icon(_PE_SAVED_CHANNEL),
                 ),
                 InlineKeyboardButton(
                     text="Добавить группу",
                     url=f"{base}?startgroup=add&admin={_DL_ADMIN_GR}",
-                    icon_custom_emoji_id=_PE_SAVED_GROUP,
+                    **_pe_icon(_PE_SAVED_GROUP),
                 ),
             ]
         ]
@@ -1339,12 +1359,12 @@ async def _publish_pick_invite_rows(bot: Bot) -> list[list[InlineKeyboardButton]
             InlineKeyboardButton(
                 text="Добавить канал",
                 callback_data="pubsel:invite_ch",
-                icon_custom_emoji_id=_PE_SAVED_CHANNEL,
+                **_pe_icon(_PE_SAVED_CHANNEL),
             ),
             InlineKeyboardButton(
                 text="Добавить группу",
                 callback_data="pubsel:invite_gr",
-                icon_custom_emoji_id=_PE_SAVED_GROUP,
+                **_pe_icon(_PE_SAVED_GROUP),
             ),
         ]
     ]
@@ -1370,7 +1390,7 @@ async def _build_pick_publish_markup(
                 InlineKeyboardButton(
                     text=text,
                     callback_data=f"pubsel:{cid}",
-                    icon_custom_emoji_id=_saved_chat_pick_icon_id(s),
+                    **_pe_icon(_saved_chat_pick_icon_id(s)),
                 )
             ]
         )
@@ -1381,7 +1401,7 @@ async def _build_pick_publish_markup(
                 InlineKeyboardButton(
                     text="Продолжить",
                     callback_data="pubsel:done",
-                    icon_custom_emoji_id=_PE_PICK_PUBLISH_CONTINUE,
+                    **_pe_icon(_PE_PICK_PUBLISH_CONTINUE),
                 )
             ]
         )
@@ -1896,7 +1916,7 @@ def _reply_btn_add_channel() -> KeyboardButton:
             user_administrator_rights=_channel_bot_rights_for_request_chat(),
             bot_administrator_rights=_channel_bot_rights_for_request_chat(),
         ),
-        icon_custom_emoji_id=_PE_SAVED_CHANNEL,
+        **_pe_icon(_PE_SAVED_CHANNEL),
     )
 
 
@@ -1909,7 +1929,7 @@ def _reply_btn_add_group() -> KeyboardButton:
             user_administrator_rights=_group_bot_rights_for_request_chat(),
             bot_administrator_rights=_group_bot_rights_for_request_chat(),
         ),
-        icon_custom_emoji_id=_PE_SAVED_GROUP,
+        **_pe_icon(_PE_SAVED_GROUP),
     )
 
 
@@ -1959,12 +1979,12 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Добавить канал",
                     callback_data="menu:add_channel",
-                    icon_custom_emoji_id=_PE_SAVED_CHANNEL,
+                    **_pe_icon(_PE_SAVED_CHANNEL),
                 ),
                 InlineKeyboardButton(
                     text="Добавить группу",
                     callback_data="menu:add_group",
-                    icon_custom_emoji_id=_PE_SAVED_GROUP,
+                    **_pe_icon(_PE_SAVED_GROUP),
                 ),
             ],
             [_ikb_menu_saved_channels()],
@@ -2520,8 +2540,7 @@ async def _lottery_grid_kb(g: dict[str, Any]) -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text=(f"{token} {n}".strip() if token else str(n)),
                 callback_data=cb,
-                icon_custom_emoji_id=custom_emoji_id,
-                **({"style": style} if style else {}),
+                **{**_pe_icon(custom_emoji_id), **({"style": style} if style else {})},
             )
         )
         if len(row) == 5:
@@ -2779,14 +2798,14 @@ def _admin_kb_giveaway(gid: int, *, can_edit_description: bool = False) -> Inlin
                     InlineKeyboardButton(
                         text="Подвести итоги",
                         callback_data=f"draw:{gid}",
-                        icon_custom_emoji_id=_PE_ADMIN_DRAW,
+                        **_pe_icon(_PE_ADMIN_DRAW),
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text="Выбрать других победителей",
                         callback_data=f"reroll:{gid}",
-                        icon_custom_emoji_id=_PE_ADMIN_REROLL,
+                        **_pe_icon(_PE_ADMIN_REROLL),
                     )
                 ],
             ]
@@ -2797,7 +2816,7 @@ def _admin_kb_giveaway(gid: int, *, can_edit_description: bool = False) -> Inlin
                 InlineKeyboardButton(
                     text="Изменить описание",
                     callback_data=f"aedesc:{gid}",
-                    icon_custom_emoji_id=_PE_ADMIN_EDIT_DESC,
+                    **_pe_icon(_PE_ADMIN_EDIT_DESC),
                 )
             ]
         )
@@ -2806,7 +2825,7 @@ def _admin_kb_giveaway(gid: int, *, can_edit_description: bool = False) -> Inlin
                 InlineKeyboardButton(
                     text="Кто участвует",
                     callback_data=f"plist:{gid}",
-                    icon_custom_emoji_id=_PE_ADMIN_PARTICIPANTS,
+                    **_pe_icon(_PE_ADMIN_PARTICIPANTS),
                 )
             ]
         )
@@ -2816,14 +2835,14 @@ def _admin_kb_giveaway(gid: int, *, can_edit_description: bool = False) -> Inlin
                 InlineKeyboardButton(
                     text="Запостить ещё раз",
                     callback_data=f"repost:{gid}",
-                    icon_custom_emoji_id=_PE_DRAFT_PUBLISH,
+                    **_pe_icon(_PE_DRAFT_PUBLISH),
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="Удалить конкурс",
                     callback_data=f"del_ask:{gid}",
-                    icon_custom_emoji_id=_PE_DRAFT_DELETE,
+                    **_pe_icon(_PE_DRAFT_DELETE),
                 )
             ],
             [_ikb_back("adm_list")],
@@ -2837,7 +2856,7 @@ def _draft_giveaway_kb(gid: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             text="Опубликовать",
             callback_data=f"dpub:{gid}",
-            icon_custom_emoji_id=_PE_DRAFT_PUBLISH,
+            **_pe_icon(_PE_DRAFT_PUBLISH),
         )
     ]]
     # Для лотереи в предпросмотре не показываем «Доп. функции» и «Пригласить каналы».
@@ -2847,14 +2866,14 @@ def _draft_giveaway_kb(gid: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Доп. функции",
                     callback_data=f"dextra:{gid}",
-                    icon_custom_emoji_id=_PE_DRAFT_EXTRA,
+                    **_pe_icon(_PE_DRAFT_EXTRA),
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="Пригласить каналы",
                     callback_data=f"dchinv:{gid}",
-                    icon_custom_emoji_id=_PE_DRAFT_INVITE_CHANNELS,
+                    **_pe_icon(_PE_DRAFT_INVITE_CHANNELS),
                 )
             ],
         ]
@@ -2865,7 +2884,7 @@ def _draft_giveaway_kb(gid: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Удалить",
                     callback_data=f"del_ask:{gid}",
-                    icon_custom_emoji_id=_PE_DRAFT_DELETE,
+                    **_pe_icon(_PE_DRAFT_DELETE),
                 )
             ],
             [_ikb_back("adm_list")],
@@ -2881,14 +2900,14 @@ def _draft_lottery_kb(gid: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Опубликовать",
                     callback_data=f"dpub:{gid}",
-                    icon_custom_emoji_id=_PE_DRAFT_PUBLISH,
+                    **_pe_icon(_PE_DRAFT_PUBLISH),
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="Удалить",
                     callback_data=f"del_ask:{gid}",
-                    icon_custom_emoji_id=_PE_DRAFT_DELETE,
+                    **_pe_icon(_PE_DRAFT_DELETE),
                 )
             ],
             [_ikb_back("adm_list")],
@@ -3038,7 +3057,7 @@ def _draft_extra_kb(g: dict[str, Any]) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Рефералов за +1 билет",
                     callback_data="noop",
-                    icon_custom_emoji_id=_PE_REF_TICKET,
+                    **_pe_icon(_PE_REF_TICKET),
                 )
             ]
         )
@@ -3537,14 +3556,14 @@ def _my_joined_list_kb(own_items: list[dict[str, Any]], joined_items: list[dict[
             InlineKeyboardButton(
                 text=f"Созданные тобой ({own_count})",
                 callback_data="my:own",
-                icon_custom_emoji_id=_PE_MY_OWN,
+                **_pe_icon(_PE_MY_OWN),
             )
         ],
         [
             InlineKeyboardButton(
                 text=f"Ты участвуешь ({joined_count})",
                 callback_data="my:joined",
-                icon_custom_emoji_id=_PE_MY_JOINED,
+                **_pe_icon(_PE_MY_JOINED),
             )
         ],
     ]
@@ -3582,17 +3601,17 @@ def _my_own_items_kb(items: list[dict[str, Any]], active_tab: str, page: int = 1
             InlineKeyboardButton(
                 text="Черновик" + (" ✅" if is_d else ""),
                 callback_data="my:own:draft",
-                icon_custom_emoji_id=_PE_OWN_DRAFT,
+                **_pe_icon(_PE_OWN_DRAFT),
             ),
             InlineKeyboardButton(
                 text="Идёт" + (" ✅" if is_a else ""),
                 callback_data="my:own:active",
-                icon_custom_emoji_id=_PE_OWN_ACTIVE,
+                **_pe_icon(_PE_OWN_ACTIVE),
             ),
             InlineKeyboardButton(
                 text="Завершён" + (" ✅" if is_f else ""),
                 callback_data="my:own:finished",
-                icon_custom_emoji_id=_PE_OWN_FINISHED,
+                **_pe_icon(_PE_OWN_FINISHED),
             ),
         ]
     )
