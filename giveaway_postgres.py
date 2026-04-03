@@ -315,6 +315,8 @@ def _ikb_menu_own() -> InlineKeyboardButton:
 def _tg_pe(emoji_id: str, placeholder: str) -> str:
     """Фрагмент HTML для кастомного (premium) emoji. Внутри — ровно один символ."""
     ph = (placeholder or "·")[:1]
+    if not _premium_custom_emoji_ui_enabled():
+        return ph
     return f'<tg-emoji emoji-id="{emoji_id}">{ph}</tg-emoji>'
 
 
@@ -2216,6 +2218,34 @@ def _restore_escaped_tg_emoji_html(src: str) -> str:
     return s
 
 
+def _outbound_caption_html(s: str) -> str:
+    """
+    Текст для подписи поста/черновика: восстановить экранированные tg-emoji,
+    а при выключенном PREMIUM_CUSTOM_EMOJI_UI убрать теги custom emoji, оставив
+    видимый символ (иначе Bot API: Invalid custom emoji identifier).
+    """
+    t = _restore_escaped_tg_emoji_html(s or "")
+    if _premium_custom_emoji_ui_enabled():
+        return t
+
+    def _glyph(m: re.Match[str]) -> str:
+        return ((m.group(1) or "")[:1] or "•")
+
+    t = re.sub(
+        r'<tg-emoji\s+emoji-id="\d+"\s*>(.*?)</tg-emoji>',
+        _glyph,
+        t,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    t = re.sub(
+        r'<emoji\s+id="\d+"\s*>(.*?)</emoji>',
+        _glyph,
+        t,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return t
+
+
 def _message_html_preserve_custom_emoji(message: Message) -> str:
     """
     Prefer Telegram-provided html_text, but if custom emoji entities exist and
@@ -3104,10 +3134,9 @@ _DRAFT_EXTRA_SCREEN_TITLE = f"{_tg_pe(_PE_DRAFT_EXTRA, '⚙️')} <b>Доп.фу
 def _giveaway_public_caption(g: dict[str, Any]) -> str:
     if _is_lottery(g):
         tickets = max(1, min(100, int(g.get("lottery_ticket_count") or 1)))
-        title_html = _restore_escaped_tg_emoji_html((g.get("title") or "").strip())
-        desc = _restore_escaped_tg_emoji_html((g.get("description") or "").strip())
-        # `description` already stored as Telegram HTML (`message.html_text`),
-        # so re-escaping here breaks custom premium emoji tags (<tg-emoji>).
+        title_html = _outbound_caption_html((g.get("title") or "").strip())
+        desc = _outbound_caption_html((g.get("description") or "").strip())
+        # `description` уже как HTML из чата; чужие custom_emoji_id убираем, если premium UI выкл.
         desc_html = desc if desc else ""
         hint = (
             "<blockquote expandable>Нажми на номер билета ниже - если попадёшь в выигрышный квадрат, "
@@ -3129,8 +3158,8 @@ def _giveaway_public_caption(g: dict[str, Any]) -> str:
             )
         return body
     return (
-        f"{_tg_pe(_PE_GW_STEP1, '🎁')} {_restore_escaped_tg_emoji_html((g.get('title') or '').strip())}\n\n"
-        f"{_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
+        f"{_tg_pe(_PE_GW_STEP1, '🎁')} {_outbound_caption_html((g.get('title') or '').strip())}\n\n"
+        f"{_outbound_caption_html(g.get('description') or '')}\n\n"
         f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
         f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
         f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
@@ -6700,9 +6729,29 @@ async def cb_crosspost_vote(query: CallbackQuery, bot: Bot) -> None:
             log.debug("notify creator crosspost yes %s: %s", creator_id, e)
 
 
-@router.message(StateFilter(default_state), F.text.startswith("/"))
+@router.message(StateFilter(default_state), F.chat.type == ChatType.PRIVATE, Command("emojiid"))
+async def cmd_emoji_id(message: Message) -> None:
+    target = message.reply_to_message or message
+    ids = _extract_all_custom_emoji_ids_from_message(target)
+    if not ids:
+        await message.answer(
+            "Не найдено premium emoji.\n"
+            "Отправь эмодзи сообщением или ответь на сообщение с эмоджи командой /emojiid."
+        )
+        return
+    lines = ["Найденные custom emoji ID:"]
+    for cid in ids:
+        lines.append(f"<code>{html.escape(cid, quote=False)}</code>")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(
+    StateFilter(default_state),
+    F.text.startswith("/"),
+    ~Command("emojiid"),
+)
 async def any_slash_show_menu(message: Message, state: FSMContext, bot: Bot) -> None:
-    """Команды вида /... кроме /start (его обрабатывает CommandStart выше по цепочке)."""
+    """Команды вида /... кроме /start и /emojiid (их обрабатывают отдельные хендлеры)."""
     if message.chat.type != ChatType.PRIVATE:
         # В группах на прочие /команды тоже молчим.
         return
@@ -6796,22 +6845,6 @@ async def menu_btn_saved_chats_reply(message: Message, state: FSMContext, bot: B
     if not message.from_user:
         return
     await _send_saved_chats_panel(bot, state, message.from_user.id)
-
-
-@router.message(StateFilter(default_state), F.chat.type == ChatType.PRIVATE, Command("emojiid"))
-async def cmd_emoji_id(message: Message) -> None:
-    target = message.reply_to_message or message
-    ids = _extract_all_custom_emoji_ids_from_message(target)
-    if not ids:
-        await message.answer(
-            "Не найдено premium emoji.\n"
-            "Отправь эмоджи сообщением или ответь на сообщение с эмоджи командой /emojiid."
-        )
-        return
-    lines = ["Найденные custom emoji ID:"]
-    for cid in ids:
-        lines.append(f"<code>{html.escape(cid, quote=False)}</code>")
-    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @router.message(StateFilter(default_state), F.chat.type == ChatType.PRIVATE, F.text)
