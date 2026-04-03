@@ -460,6 +460,14 @@ def _is_private_invite_link(text: str) -> bool:
 
 def _forwarded_chat_id(message: Message) -> Optional[int]:
     """Извлекает chat_id из пересланного сообщения (старый и новый форматы Telegram)."""
+    sc = getattr(message, "sender_chat", None)
+    if sc is not None:
+        try:
+            st = getattr(sc, "type", None)
+            if st is None or st in ("channel", "group", "supergroup"):
+                return int(sc.id)
+        except Exception:
+            pass
     if getattr(message, "forward_from_chat", None):
         try:
             return int(message.forward_from_chat.id)
@@ -6595,10 +6603,14 @@ async def cb_dchex(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         state,
         bot,
         "✏️ <b>Дополнительные каналы</b>\n\n"
-        "Отправь каналы, на которые тоже нужно подписаться:\n"
-        "<code>@канал</code>, ссылка или ID через запятую / с новой строки.\n\n"
+        "Укажи каналы, на которые тоже нужно подписаться — любым из способов:\n"
+        "• <b>Кнопки под строкой ввода</b> «Добавить канал» / «Добавить группу» (выбор чата в Telegram);\n"
+        "• <b>Пересланное сообщение</b> из нужного канала или группы;\n"
+        "• Текстом: <code>@username</code>, <code>t.me/…</code> (кроме приватных <code>t.me/+…</code>), "
+        "числовой id — несколько через запятую или с новой строки.\n\n"
+        "<i>Приватные инвайт-ссылки бот не превращает в id: добавь канал кнопкой выше или перешли пост оттуда.</i>\n\n"
         "Бот запросит согласие у владельцев. После «Проверить согласия» согласованные чаты попадут в условия; "
-        "Режим «подписка без поста» при необходимости — в «Управление каналами».",
+        "режим «подписка без поста» — в «Управление каналами».",
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [_ikb_back(f"ddraft:{gid}")],
@@ -6636,10 +6648,19 @@ async def sg_edit_channels_extra(message: Message, state: FSMContext, bot: Bot) 
     if prev_pending:
         async with _pg_conn() as db:
             await _crosspost_pending_delete_bundle(db, int(prev_pending["id"]))
-    tokens_txt = _parse_multi_channel_tokens(message.text or "")
-    fcid = _forwarded_chat_id(message)
-    if not tokens_txt and fcid is not None:
-        tokens_txt = [str(fcid)]
+    tokens_txt: list[str] = []
+    cs = getattr(message, "chat_shared", None)
+    if cs is not None and int(getattr(cs, "request_id", -1)) in (
+        REQ_CHAT_ADD_CHANNEL,
+        REQ_CHAT_ADD_GROUP,
+    ):
+        tokens_txt = [str(int(cs.chat_id))]
+    if not tokens_txt:
+        tokens_txt = _parse_multi_channel_tokens(message.text or "")
+    if not tokens_txt:
+        fcid = _forwarded_chat_id(message)
+        if fcid is not None:
+            tokens_txt = [str(fcid)]
     back_kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [_ikb_back(f"ddraft:{egid}")],
