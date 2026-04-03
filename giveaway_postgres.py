@@ -2207,7 +2207,7 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
     out_parts: list[str] = []
     all_entities: list[MessageEntity] = []
     pat = re.compile(
-        r'<tg-emoji\s+emoji-id=["\'](\d+)["\']\s*>(.*?)</tg-emoji>',
+        r'<tg-emoji\s+emoji-id\s*=\s*["\']?(\d+)["\']?\s*>(.*?)</tg-emoji>',
         flags=re.IGNORECASE | re.DOTALL,
     )
     src = _restore_escaped_tg_emoji_html(src_html or "")
@@ -2222,7 +2222,7 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
                 MessageEntity(type=e.type, offset=base + int(e.offset), length=int(e.length))
             )
         eid = (m.group(1) or "").strip()
-        glyph = _html_to_plain_text_keep_linebreaks(m.group(2) or "")[:1] or "•"
+        glyph = (_html_to_plain_text_keep_linebreaks(m.group(2) or "") or "").strip() or "•"
         base = _utf16_len("".join(out_parts))
         out_parts.append(glyph)
         if eid:
@@ -2326,30 +2326,11 @@ def _restore_escaped_tg_emoji_html(src: str) -> str:
 
 def _outbound_caption_html(s: str) -> str:
     """
-    Текст для подписи поста/черновика: восстановить экранированные tg-emoji,
-    а при выключенном PREMIUM_CUSTOM_EMOJI_UI убрать теги custom emoji, оставив
-    видимый символ (иначе Bot API: Invalid custom emoji identifier).
+    Название/описание из БД (как прислал пользователь в чат): только нормализация тегов.
+    Не вырезать &lt;tg-emoji&gt;: ID пришли из сообщения пользователя и должны отображаться
+    в посте. Флаг PREMIUM_CUSTOM_EMOJI_UI влияет только на _tg_pe/_pe_icon в шаблоне.
     """
-    t = _restore_escaped_tg_emoji_html(s or "")
-    if _premium_custom_emoji_ui_enabled():
-        return t
-
-    def _glyph(m: re.Match[str]) -> str:
-        return ((m.group(2) or "")[:1] or "•")
-
-    t = re.sub(
-        r'<tg-emoji\s+emoji-id=["\']?(\d+)["\']?\s*>(.*?)</tg-emoji>',
-        _glyph,
-        t,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    t = re.sub(
-        r'<emoji\s+id="\d+"\s*>(.*?)</emoji>',
-        _glyph,
-        t,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    return t
+    return _restore_escaped_tg_emoji_html(s or "")
 
 
 def _message_html_preserve_custom_emoji(message: Message) -> str:
@@ -2372,9 +2353,10 @@ def _message_html_preserve_custom_emoji(message: Message) -> str:
             return html_text
         return _restore_escaped_tg_emoji_html(html_text or html.escape(plain))
     if "<tg-emoji" in html_text:
+        # aiogram unparse уже дал теги + форматирование (<b> и т.д.)
         return html_text
 
-    # Fallback: preserve custom emoji tags in plain text.
+    # Entities с custom_emoji есть, а в html_text не развернулись теги — собираем из plain.
     out = html.escape(plain, quote=False)
     custom_entities: list[tuple[int, int, str]] = []
     for e in entities:
@@ -2391,9 +2373,10 @@ def _message_html_preserve_custom_emoji(message: Message) -> str:
         t = _utf16_offset_to_py_index(plain, off + ln)
         custom_entities.append((s, t, cid))
     if not custom_entities:
+        if "<tg-emoji" in html_text:
+            return html_text
         return html_text or out
 
-    # Rebuild from original text to avoid index drift on escaped output.
     parts: list[str] = []
     cursor = 0
     for s, t, cid in sorted(custom_entities, key=lambda x: x[0]):
@@ -2401,7 +2384,7 @@ def _message_html_preserve_custom_emoji(message: Message) -> str:
             continue
         parts.append(html.escape(plain[cursor:s], quote=False))
         glyph = plain[s:t] or "•"
-        parts.append(f'<tg-emoji emoji-id="{cid}">{html.escape(glyph[:1], quote=False)}</tg-emoji>')
+        parts.append(f'<tg-emoji emoji-id="{cid}">{html.escape(glyph, quote=False)}</tg-emoji>')
         cursor = t
     parts.append(html.escape(plain[cursor:], quote=False))
     return _restore_escaped_tg_emoji_html("".join(parts))
