@@ -42,6 +42,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.state import State, StatesGroup, default_state
 from aiogram.types import (
     CallbackQuery,
+    Chat,
     ChatMemberUpdated,
     ChatMemberOwner,
     ChatAdministratorRights,
@@ -163,6 +164,8 @@ TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 USERBOT_API_ID = os.environ.get("USERBOT_API_ID", "").strip()
 USERBOT_API_HASH = os.environ.get("USERBOT_API_HASH", "").strip()
 USERBOT_SESSION = os.environ.get("USERBOT_SESSION", "").strip()
+# Необязательно: числовой user_id аккаунта userbot (если не задан — берётся из Telethon get_me()).
+USERBOT_USER_ID_ENV = os.environ.get("USERBOT_USER_ID", "").strip()
 
 if not TOKEN:
     raise SystemExit("Задайте BOT_TOKEN в переменных окружения или .env")
@@ -1065,8 +1068,13 @@ async def delete_saved_chat(db: PgConnAdapter, user_id: int, chat_id: int) -> No
     await db.commit()
 
 
-_DL_ADMIN_CH = "post_messages+edit_messages+delete_messages+invite_users+pin_messages"
-_DL_ADMIN_GR = "manage_chat+delete_messages+invite_users+pin_messages+restrict_members"
+# promote_members у бота нужен, чтобы после добавления бот мог назначить userbot админом (promoteChatMember).
+_DL_ADMIN_CH = (
+    "post_messages+edit_messages+delete_messages+invite_users+pin_messages+promote_members"
+)
+_DL_ADMIN_GR = (
+    "manage_chat+delete_messages+invite_users+pin_messages+restrict_members+promote_members"
+)
 
 
 def _normalize_bot_uname(bot_username: str) -> str:
@@ -1820,12 +1828,14 @@ def _main_menu_text() -> str:
     """Текст главного экрана (подпись к фото) в личке."""
     return (
         "🎁 Добро пожаловать в AniGive!\n\n"
-        "AniGive - это удобный бот, созданный для проведения розыгрышей в каналах и чатах.\n\n"
+        "        AniGive - это удобный бот, созданный для проведения розыгрышей в каналах и чатах.\n\n"
         "✨ Что умеет бот:\n"
-        "•Создание розыгрышей за пару кликов\n"
+        "<blockquote>"
+        "• Создание розыгрышей за пару кликов\n"
         "• Честный и случайный выбор победителей\n"
         "• Поддержка каналов и чатов\n"
-        "• Удобное управление и быстрый запуск\n"
+        "• Удобное управление и быстрый запуск"
+        "</blockquote>\n\n"
         "Запускайте розыгрыши, привлекайте аудиторию и радуйте своих подписчиков вместе с AniGive 🚀"
     )
 
@@ -1846,7 +1856,7 @@ def _channel_bot_rights_for_request_chat() -> ChatAdministratorRights:
         can_delete_messages=True,
         can_manage_video_chats=False,
         can_restrict_members=False,
-        can_promote_members=False,
+        can_promote_members=True,
         can_change_info=False,
         can_invite_users=True,
         can_post_stories=False,
@@ -1866,7 +1876,7 @@ def _group_bot_rights_for_request_chat() -> ChatAdministratorRights:
         can_delete_messages=True,
         can_manage_video_chats=False,
         can_restrict_members=True,
-        can_promote_members=False,
+        can_promote_members=True,
         can_change_info=False,
         can_invite_users=True,
         can_post_stories=False,
@@ -3940,6 +3950,19 @@ async def on_bot_my_chat_member(
         return
     if ctype == "channel":
         _kickoff_userbot_join(int(chat.id), uname)
+    if (
+        new.status == "administrator"
+        and _userbot_configured()
+        and _userbot_auto_promote_enabled()
+    ):
+        asyncio.create_task(
+            _promote_userbot_after_bot_added(
+                bot,
+                chat,
+                chat_public_username=uname,
+                chat_kind=ctype,
+            )
+        )
     key = StorageKey(bot_id=bot.id, chat_id=actor.id, user_id=actor.id)
     ctx = FSMContext(storage=dispatcher.storage, key=key)
     data = await ctx.get_data()
@@ -7143,6 +7166,13 @@ async def cb_repost(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
 _auto_task: Optional[asyncio.Task] = None
 _userbot_client: Any = None
 _userbot_started = False
+_userbot_peer_id_cache: Optional[int] = None
+
+
+def _userbot_auto_promote_enabled() -> bool:
+    """Автоматом выдавать userbot права админа после добавления бота (USERBOT_AUTO_PROMOTE=0 — выкл)."""
+    v = (os.environ.get("USERBOT_AUTO_PROMOTE") or "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
 
 
 def _userbot_configured() -> bool:
@@ -7169,6 +7199,125 @@ async def _get_userbot_client() -> Any:
             log.warning("userbot start failed: %s", e)
             return None
     return _userbot_client
+
+
+async def _userbot_peer_telegram_user_id() -> Optional[int]:
+    """Telegram user_id аккаунта userbot (для promoteChatMember)."""
+    global _userbot_peer_id_cache
+    if USERBOT_USER_ID_ENV.isdigit():
+        return int(USERBOT_USER_ID_ENV)
+    if _userbot_peer_id_cache is not None:
+        return _userbot_peer_id_cache
+    ub = await _get_userbot_client()
+    if ub is None:
+        return None
+    try:
+        me = await ub.get_me()
+        if me is None:
+            return None
+        _userbot_peer_id_cache = int(me.id)
+        return _userbot_peer_id_cache
+    except Exception:
+        return None
+
+
+async def _promote_userbot_after_bot_added(
+    bot: Bot,
+    chat: Chat,
+    *,
+    chat_public_username: Optional[str],
+    chat_kind: str,
+) -> None:
+    """После добавления бота в канал/группу: вступить userbot'ом и выдать ему те же рабочие права админа.
+
+    Требует, чтобы у самого бота в этом чате было can_promote_members (см. admin= в ссылке «Добавить …»).
+    """
+    uid = await _userbot_peer_telegram_user_id()
+    if uid is None:
+        log.warning("userbot: не удалось узнать user_id — задайте USERBOT_USER_ID или проверьте сессию")
+        return
+    cid = int(chat.id)
+    try:
+        await asyncio.sleep(1.0)
+        if chat_kind == "channel" and chat_public_username:
+            await _userbot_try_join_channel(cid, chat_public_username)
+        elif chat_kind != "channel":
+            # В группе/супергруппе JoinChannelRequest не используем — ждём, пока userbot уже в чате.
+            pass
+
+        for _ in range(36):
+            try:
+                m = await bot.get_chat_member(cid, uid)
+                st = getattr(m, "status", "")
+                if st not in ("left", "kicked"):
+                    break
+            except TelegramBadRequest:
+                pass
+            await asyncio.sleep(0.5)
+        else:
+            log.warning(
+                "userbot %s не появился в чате %s как участник — не удалось назначить админом "
+                "(для приватных каналов добавьте аккаунт userbot вручную или дайте инвайт)",
+                uid,
+                cid,
+            )
+            return
+
+        me_bot = await bot.get_me()
+        bm = await bot.get_chat_member(cid, me_bot.id)
+        if getattr(bm, "status", "") != "administrator":
+            return
+        if getattr(bm, "can_promote_members", None) is not True:
+            log.warning(
+                "У бота нет «добавлять администраторов» в чате %s — откройте ссылку «Добавить в канал/группу» заново "
+                "(в admin= должно быть promote_members)",
+                cid,
+            )
+            return
+
+        if chat_kind == "channel":
+            await bot.promote_chat_member(
+                chat_id=cid,
+                user_id=uid,
+                is_anonymous=False,
+                can_manage_chat=False,
+                can_change_info=False,
+                can_post_messages=True,
+                can_edit_messages=True,
+                can_delete_messages=True,
+                can_invite_users=True,
+                can_pin_messages=True,
+                can_promote_members=False,
+                can_manage_video_chats=False,
+                can_restrict_members=False,
+                can_post_stories=False,
+                can_edit_stories=False,
+                can_delete_stories=False,
+            )
+        else:
+            await bot.promote_chat_member(
+                chat_id=cid,
+                user_id=uid,
+                is_anonymous=False,
+                can_manage_chat=True,
+                can_change_info=False,
+                can_post_messages=True,
+                can_edit_messages=True,
+                can_delete_messages=True,
+                can_invite_users=True,
+                can_pin_messages=True,
+                can_promote_members=False,
+                can_manage_video_chats=False,
+                can_restrict_members=True,
+                can_post_stories=False,
+                can_edit_stories=False,
+                can_delete_stories=False,
+            )
+        log.info("userbot %s назначен администратором в чате %s", uid, cid)
+    except TelegramBadRequest as e:
+        log.warning("promote_chat_member(userbot): %s", e)
+    except Exception:
+        log.exception("promote userbot in chat %s", cid)
 
 
 async def _userbot_try_join_channel(chat_id: int, username: Optional[str]) -> bool:
