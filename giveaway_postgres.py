@@ -2240,6 +2240,85 @@ def _restore_escaped_tg_emoji_html(src: str) -> str:
     return s
 
 
+_TG_EMOJI_OPEN_TAG = re.compile(r"<tg-emoji([^>]*)>(.*?)</tg-emoji>", re.IGNORECASE | re.DOTALL)
+
+
+def _tg_open_attrs_emoji_id(attrs: str) -> str:
+    """Достаёт emoji-id из атрибутов открывающего тега <tg-emoji ...>."""
+    a = attrs or ""
+    for pat in (
+        r'emoji-id\s*=\s*"([^"]*)"',
+        r"emoji-id\s*=\s*'([^']*)'",
+        r"emoji-id\s*=\s*(\d+)",
+    ):
+        m = re.search(pat, a, re.IGNORECASE)
+        if m:
+            return (m.group(1) or "").strip()
+    return ""
+
+
+def _sanitize_tg_emoji_html_for_send(html: str, _depth: int = 0) -> str:
+    """
+    Bot API с parse_mode=HTML падает на пустом/нечисловом/битом emoji-id в <tg-emoji>.
+    Убираем такие теги (оставляем один видимый символ); у валидных id сжимаем содержимое до одного глифа.
+    """
+    if not html or _depth > 16:
+        return html or ""
+
+    def repl(m: re.Match) -> str:
+        attrs, inner = m.group(1) or "", m.group(2) or ""
+        inner_s = _sanitize_tg_emoji_html_for_send(inner, _depth + 1)
+        glyph_src = _html_to_plain_text_keep_linebreaks(inner_s).strip()
+        glyph = (glyph_src[:1] if glyph_src else "·")
+        eid = _tg_open_attrs_emoji_id(attrs)
+        if eid.isdigit() and 1 <= len(eid) <= 32:
+            return f'<tg-emoji emoji-id="{eid}">{glyph}</tg-emoji>'
+        return glyph
+
+    return _TG_EMOJI_OPEN_TAG.sub(repl, html)
+
+
+def _strip_all_tg_emoji_for_send(html: str) -> str:
+    """Последний шаг: убрать все <tg-emoji>, оставить только заменитель-символ (жирный/blockquote и т.д. сохраняются)."""
+    s = html or ""
+    for _ in range(24):
+        new_s = _TG_EMOJI_OPEN_TAG.sub(
+            lambda m: (
+                _html_to_plain_text_keep_linebreaks((m.group(2) or ""))[:1] or "·"
+            ),
+            s,
+        )
+        if new_s == s:
+            break
+        s = new_s
+    return s
+
+
+async def _send_html_with_emoji_fallback(
+    card: str,
+    send: Any,
+) -> Message:
+    """send(c: str) -> Message: HTML; при ошибке разбора сущностей/emoji — без <tg-emoji>."""
+    stripped = _strip_all_tg_emoji_for_send(card)
+    try:
+        return await send(card)
+    except TelegramBadRequest as e:
+        err = (str(e) or "").lower()
+        if stripped != card and any(
+            x in err
+            for x in (
+                "custom emoji",
+                "entities",
+                "parse",
+                "can't parse",
+                "cannot parse",
+            )
+        ):
+            log.warning("send HTML failed (%s), retry without tg-emoji", e)
+            return await send(stripped)
+        raise
+
+
 def _message_html_preserve_custom_emoji(message: Message) -> str:
     """
     Prefer Telegram-provided html_text, but if custom emoji entities exist and
@@ -2943,24 +3022,36 @@ async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, A
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
     if kind == "photo" and fid:
-        return await bot.send_photo(
-            chat_id, fid, caption=card, reply_markup=kb, parse_mode="HTML"
+        return await _send_html_with_emoji_fallback(
+            card,
+            lambda c: bot.send_photo(
+                chat_id, fid, caption=c, reply_markup=kb, parse_mode="HTML"
+            ),
         )
     if kind == "animation" and fid:
-        return await bot.send_animation(
-            chat_id, fid, caption=card, reply_markup=kb, parse_mode="HTML"
+        return await _send_html_with_emoji_fallback(
+            card,
+            lambda c: bot.send_animation(
+                chat_id, fid, caption=c, reply_markup=kb, parse_mode="HTML"
+            ),
         )
     if kind == "video" and fid:
-        return await bot.send_video(
-            chat_id, fid, caption=card, reply_markup=kb, parse_mode="HTML"
+        return await _send_html_with_emoji_fallback(
+            card,
+            lambda c: bot.send_video(
+                chat_id, fid, caption=c, reply_markup=kb, parse_mode="HTML"
+            ),
         )
-    return await bot.send_message(
-        chat_id,
+    return await _send_html_with_emoji_fallback(
         card,
-        reply_markup=kb,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        link_preview_options=_LINK_PREVIEW_OFF,
+        lambda c: bot.send_message(
+            chat_id,
+            c,
+            reply_markup=kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            link_preview_options=_LINK_PREVIEW_OFF,
+        ),
     )
 
 
@@ -3169,22 +3260,25 @@ def _giveaway_public_caption(g: dict[str, Any]) -> str:
             f"{hint}"
         )
         if desc_html:
-            return (
+            raw = (
                 f"🎰 {title_html}\n\n"
                 f"{desc_html}\n\n"
                 f"Количество билетов: <b>{tickets}</b>\n"
                 f"Победителей: <b>{g['winners_count']}</b>\n\n"
                 f"{hint}"
             )
-        return body
-    return (
-        f"{_tg_pe(_PE_GW_STEP1, '🎁')} {_restore_escaped_tg_emoji_html((g.get('title') or '').strip())}\n\n"
-        f"{_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
-        f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
-        f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
-        f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
-        "чтобы попасть в розыгрыш"
-    )
+        else:
+            raw = body
+    else:
+        raw = (
+            f"{_tg_pe(_PE_GW_STEP1, '🎁')} {_restore_escaped_tg_emoji_html((g.get('title') or '').strip())}\n\n"
+            f"{_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
+            f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
+            f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
+            f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
+            "чтобы попасть в розыгрыш"
+        )
+    return _sanitize_tg_emoji_html_for_send(raw)
 
 
 async def _edit_giveaway_public_message(
