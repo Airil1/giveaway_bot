@@ -680,6 +680,20 @@ async def init_db() -> None:
                         )
                 except Exception:
                     pass
+        try:
+            await conn.execute(
+                """
+                UPDATE giveaways AS g SET status = 'finished'
+                WHERE g.giveaway_type = 'lottery'
+                  AND g.status = 'active'
+                  AND (
+                    SELECT COUNT(*)::int FROM lottery_picks lp
+                    WHERE lp.giveaway_id = g.id AND lp.is_winner = 1
+                  ) >= g.winners_count
+                """
+            )
+        except Exception:
+            log.exception("repair stale lottery finished status")
         await conn.commit()
 
 
@@ -2987,46 +3001,71 @@ async def _auto_join_if_possible(
     return True
 
 
-def _admin_kb_giveaway(gid: int, *, can_edit_description: bool = False) -> InlineKeyboardMarkup:
+def _admin_kb_giveaway(g: dict[str, Any]) -> InlineKeyboardMarkup:
+    """Меню автора для опубликованного розыгрыша/лотереи (не черновик)."""
+    gid = int(g["id"])
+    st = (g.get("status") or "").strip()
+    lot = _is_lottery(g)
     rows: list[list[InlineKeyboardButton]] = []
-    if can_edit_description:
-        rows.extend(
-            [
+
+    if not lot:
+        if st == "active":
+            rows.extend(
+                [
+                    [
+                        InlineKeyboardButton(
+                            text="Подвести итоги",
+                            callback_data=f"draw:{gid}",
+                            **_pe_icon(_PE_ADMIN_DRAW),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Выбрать других победителей",
+                            callback_data=f"reroll:{gid}",
+                            **_pe_icon(_PE_ADMIN_REROLL),
+                        )
+                    ],
+                ]
+            )
+            rows.append(
                 [
                     InlineKeyboardButton(
-                        text="Подвести итоги",
-                        callback_data=f"draw:{gid}",
-                        **_pe_icon(_PE_ADMIN_DRAW),
+                        text="Изменить описание",
+                        callback_data=f"aedesc:{gid}",
+                        **_pe_icon(_PE_ADMIN_EDIT_DESC),
                     )
-                ],
+                ]
+            )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="Кто участвует",
+                        callback_data=f"plist:{gid}",
+                        **_pe_icon(_PE_ADMIN_PARTICIPANTS),
+                    )
+                ]
+            )
+        elif st == "finished":
+            rows.append(
                 [
                     InlineKeyboardButton(
                         text="Выбрать других победителей",
                         callback_data=f"reroll:{gid}",
                         **_pe_icon(_PE_ADMIN_REROLL),
                     )
-                ],
-            ]
-        )
-    if can_edit_description:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Изменить описание",
-                    callback_data=f"aedesc:{gid}",
-                    **_pe_icon(_PE_ADMIN_EDIT_DESC),
-                )
-            ]
-        )
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="Кто участвует",
-                    callback_data=f"plist:{gid}",
-                    **_pe_icon(_PE_ADMIN_PARTICIPANTS),
-                )
-            ]
-        )
+                ]
+            )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="Кто участвует",
+                        callback_data=f"plist:{gid}",
+                        **_pe_icon(_PE_ADMIN_PARTICIPANTS),
+                    )
+                ]
+            )
+
     rows.extend(
         [
             [
@@ -3816,9 +3855,7 @@ async def _publish_draft_giveaway_live(
         state,
         bot,
         f"✅ Розыгрыш <b>#{gid}</b> опубликован.\n\nУправление:",
-        _admin_kb_giveaway(
-            gid, can_edit_description=(not _is_lottery(g))
-        ),
+        _admin_kb_giveaway(g),
     )
     return True
 
@@ -4589,10 +4626,7 @@ async def cb_admin_giveaway_open(query: CallbackQuery, state: FSMContext, bot: B
         f"Сейчас: {st_ru}\n\n"
         "<i>Это меню видишь только ты — ты автор.</i>"
     )
-    can_edit = st == "active" and not _is_lottery(g)
-    await _render_callback_screen(
-        query, state, bot, text, _admin_kb_giveaway(gid, can_edit_description=can_edit)
-    )
+    await _render_callback_screen(query, state, bot, text, _admin_kb_giveaway(g))
 
 
 @router.callback_query(F.data.startswith("aedesc:"))
@@ -4666,7 +4700,7 @@ async def sg_edit_published_description(message: Message, state: FSMContext, bot
         log.debug("delete edit desc input: %s", e)
     sent = await message.answer(
         "✅ Описание в посте (и дублях, если есть) обновлено.",
-        reply_markup=_admin_kb_giveaway(gid, can_edit_description=True),
+        reply_markup=_admin_kb_giveaway(g),
     )
     await _remember_ui(state, sent.chat.id, sent.message_id)
 
@@ -7323,6 +7357,11 @@ async def cb_lottery_pick(query: CallbackQuery, bot: Bot) -> None:
             "INSERT INTO lottery_picks (giveaway_id, user_id, ticket_no, is_winner, won_at) VALUES (?, ?, ?, ?, ?)",
             (gid, uid, ticket_no, is_win, (_utc_now().isoformat() if is_win else None)),
         )
+        if is_win and (winners_so_far + 1) >= winners_needed:
+            await db.execute(
+                "UPDATE giveaways SET status = 'finished' WHERE id = ? AND giveaway_type = 'lottery'",
+                (gid,),
+            )
         await db.commit()
     try:
         async with _pg_conn() as dbf:
@@ -7424,13 +7463,14 @@ async def cb_draw(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
             (sent.chat.id, sent.message_id, wjson, json.dumps(mirror_res, ensure_ascii=False), gid),
         )
         await db.commit()
+        g_fin = await get_giveaway(db, gid)
     await _notify_participants_finished(bot, g, winners)
     await _render_callback_screen(
         query,
         state,
         bot,
-        "✅ Победители выбраны.\nИтог ушёл туда, где висел пост, и в связанные каналы, если они были.",
-        back,
+        "✅ Победители выбраны.\nИтог ушёл туда, где висел пост, и в связанные каналах, если настраивали.",
+        _admin_kb_giveaway(g_fin if g_fin is not None else g),
     )
 
 
@@ -7471,7 +7511,6 @@ async def _reroll_apply_and_publish(
     g: dict[str, Any],
     gid: int,
     winners: list[int],
-    back: InlineKeyboardMarkup,
 ) -> None:
     body = await _format_winners_lines_html(bot, gid, winners)
     gt = _giveaway_title_html(g, gid)
@@ -7487,13 +7526,15 @@ async def _reroll_apply_and_publish(
             (sent.chat.id, sent.message_id, wjson, json.dumps(mirror_res, ensure_ascii=False), gid),
         )
         await db.commit()
+        g_after = await get_giveaway(db, gid)
     await _notify_participants_finished(bot, g, winners)
+    g_kb = g_after if g_after is not None else g
     await _render_callback_screen(
         query,
         state,
         bot,
         "✅ Перевыбрали.\nНовый итог там же, где пост, и в связанных каналах, если настраивали.",
-        back,
+        _admin_kb_giveaway(g_kb),
     )
 
 
@@ -7574,7 +7615,7 @@ async def cb_reroll_all(query: CallbackQuery, state: FSMContext, bot: Bot) -> No
             back,
         )
         return
-    await _reroll_apply_and_publish(query, state, bot, g, gid, winners, back)
+    await _reroll_apply_and_publish(query, state, bot, g, gid, winners)
 
 
 @router.callback_query(F.data.startswith("rerollp:"))
@@ -7636,7 +7677,7 @@ async def cb_reroll_place(query: CallbackQuery, state: FSMContext, bot: Bot) -> 
         return
     new_list = list(prev)
     new_list[place - 1] = new_one[0]
-    await _reroll_apply_and_publish(query, state, bot, g, gid, new_list, back)
+    await _reroll_apply_and_publish(query, state, bot, g, gid, new_list)
 
 
 @router.callback_query(F.data.startswith("plist:"))
@@ -7735,16 +7776,22 @@ async def cb_repost(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         return
     async with _pg_conn() as db:
         g_new = await get_giveaway(db, new_gid)
+    if not g_new:
+        await _render_callback_screen(
+            query,
+            state,
+            bot,
+            f"📣 Новый розыгрыш <b>#{new_gid}</b> опубликован, но не удалось загрузить карточку управления — открой список «Мои розыгрыши».",
+            _kb_back_admin_giveaway(new_gid),
+        )
+        return
     await _render_callback_screen(
         query,
         state,
         bot,
         "📣 Опубликован <b>новый</b> такой же розыгрыш "
         f"<b>#{new_gid}</b> во все выбранные каналы (исходный <b>#{gid}</b> без изменений).",
-        _admin_kb_giveaway(
-            new_gid,
-            can_edit_description=(g_new is not None and not _is_lottery(g_new)),
-        ),
+        _admin_kb_giveaway(g_new),
     )
 
 
