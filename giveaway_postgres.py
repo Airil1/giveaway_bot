@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import secrets
+from urllib.parse import unquote
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -456,6 +457,29 @@ def _normalize_channel_token(t: str) -> str:
 def _is_private_invite_link(text: str) -> bool:
     s = (text or "").strip().lower()
     return ("t.me/+" in s) or ("t.me/joinchat/" in s)
+
+
+def _invite_link_hash(text: str) -> Optional[str]:
+    """Хеш из приватной инвайт-ссылки (t.me/+… / joinchat/… — как для Telethon Check/ImportChatInvite)."""
+    s = (text or "").strip()
+    if not s:
+        return None
+    low = s.lower()
+    code: Optional[str] = None
+    if "t.me/+" in low:
+        idx = low.index("t.me/+") + len("t.me/+")
+        code = s[idx:].split("?", 1)[0].split("/", 1)[0]
+    elif "t.me/joinchat/" in low:
+        tail = s[low.index("t.me/joinchat/") + len("t.me/joinchat/") :]
+        code = tail.split("?", 1)[0].split("/", 1)[0]
+    elif low.startswith("joinchat/"):
+        code = s[len("joinchat/") :].split("?", 1)[0].split("/", 1)[0]
+    elif s.strip().startswith("+"):
+        code = s.strip()[1:].split("?", 1)[0].split("/", 1)[0]
+    if not code:
+        return None
+    code = unquote(code.strip())
+    return code or None
 
 
 def _forwarded_chat_id(message: Message) -> Optional[int]:
@@ -1716,7 +1740,8 @@ async def _resolve_publish_chat(bot: Bot, message: Message) -> tuple[Optional[in
         return (
             None,
             "Перешли <b>любое сообщение</b> из нужного канала или группы "
-            "или напиши @username, ссылку <code>t.me/…</code>, числовой id канала "
+            "или напиши @username, ссылку <code>t.me/…</code>, приватную <code>t.me/+…</code> "
+            "(если настроен userbot на сервере), числовой id канала "
             "(например <code>3727559356</code>) или полный id <code>-100…</code>.",
         )
 
@@ -1725,20 +1750,25 @@ async def _resolve_publish_chat(bot: Bot, message: Message) -> tuple[Optional[in
         ident = int(raw)
     else:
         if _is_private_invite_link(raw):
-            return (
-                None,
-                "Ссылки вида <code>t.me/+...</code> Telegram Bot API не резолвит в id чата. "
-                "Добавь группу кнопкой «Добавить группу» (или перешли сообщение из чата), "
-                "после этого чат можно выбрать из списка.",
+            resolved = await _resolve_private_invite_to_bot_chat_id(raw)
+            if resolved is None:
+                return (
+                    None,
+                    "Не удалось открыть ссылку <code>t.me/+…</code>. "
+                    "Нужны на сервере <code>USERBOT_API_ID</code>, <code>USERBOT_API_HASH</code>, "
+                    "<code>USERBOT_SESSION</code>, чтобы аккаунт userbot мог вступить по ссылке; "
+                    "иначе перешли сообщение из чата или укажи числовой id.",
+                )
+            ident = int(resolved)
+        else:
+            token = _normalize_channel_token(raw)
+            if not token:
+                return None, "Не понял, о каком чате речь. Перешли сообщение из канала/группы или напиши @username."
+            ident = (
+                f"@{token}"
+                if not token.lstrip("-").isdigit()
+                else int(token)
             )
-        token = _normalize_channel_token(raw)
-        if not token:
-            return None, "Не понял, о каком чате речь. Перешли сообщение из канала/группы или напиши @username."
-        ident = (
-            f"@{token}"
-            if not token.lstrip("-").isdigit()
-            else int(token)
-        )
 
     try:
         if isinstance(ident, int):
@@ -2667,13 +2697,20 @@ async def _lottery_grid_kb(g: dict[str, Any]) -> InlineKeyboardMarkup:
     base_style = _lottery_button_style(str(g.get("lottery_cell_color") or "blue"))
     custom_emoji_id = (g.get("lottery_button_custom_emoji_id") or "").strip() or None
     picks: dict[int, int] = {}
-    has_winner = False
+    winners_needed = max(1, min(15, int(g.get("winners_count") or 1)))
+    winners_so_far = 0
     async with _pg_conn() as db:
         cur_w = await db.execute(
-            "SELECT 1 FROM lottery_picks WHERE giveaway_id = ? AND is_winner = 1 LIMIT 1",
+            "SELECT COUNT(*) AS c FROM lottery_picks WHERE giveaway_id = ? AND is_winner = 1",
             (gid,),
         )
-        has_winner = (await cur_w.fetchone()) is not None
+        row_w = await cur_w.fetchone()
+        if row_w is not None:
+            try:
+                winners_so_far = int(row_w["c"])
+            except (KeyError, TypeError, ValueError):
+                winners_so_far = 0
+        lottery_complete = winners_so_far >= winners_needed
         cur = await db.execute(
             "SELECT ticket_no, is_winner FROM lottery_picks WHERE giveaway_id = ?",
             (gid,),
@@ -2685,7 +2722,7 @@ async def _lottery_grid_kb(g: dict[str, Any]) -> InlineKeyboardMarkup:
     for n in range(1, total + 1):
         status = picks.get(n)
         if status is None:
-            if has_winner:
+            if lottery_complete:
                 cb = "noop"
                 style = ""
             else:
@@ -3582,18 +3619,14 @@ async def _send_giveaway_announcement_to_chat(
     )
 
 
-async def _publish_draft_giveaway_live(
-    bot: Bot, query: CallbackQuery, state: FSMContext, gid: int, uid: int
-) -> bool:
-    """Публикует черновик в канал(ы). True — успех, False — уже показали ошибку."""
+async def _publish_draft_giveaway_core(bot: Bot, gid: int) -> tuple[bool, str]:
+    """Публикует черновик в канал(ы): лотерея — случайные выигрышные билеты; статус → active."""
     async with _pg_conn() as db:
         g = await get_giveaway(db, gid)
-    if not g or not _is_giveaway_owner(g, uid):
-        await query.answer("Нет доступа", show_alert=True)
-        return False
+    if not g:
+        return False, "Розыгрыш не найден."
     if g.get("status") != "draft":
-        await query.answer("Этот розыгрыш уже не черновик.", show_alert=True)
-        return False
+        return False, "Этот розыгрыш уже не черновик."
     if _is_lottery(g):
         raw = (g.get("lottery_winning_tickets_json") or "").strip()
         has_winners = False
@@ -3616,13 +3649,11 @@ async def _publish_draft_giveaway_live(
                 g = await get_giveaway(dbr, gid)
     publish_ids = _publish_chat_ids_from_g(g)
     if not publish_ids:
-        await query.answer("Не указаны каналы для публикации.", show_alert=True)
-        return False
+        return False, "Не указаны каналы для публикации."
     for cid in publish_ids:
         perm = await _validate_publish_target_for_send(bot, int(cid))
         if perm:
-            await query.answer(perm.replace("<b>", "").replace("</b>", "")[:180], show_alert=True)
-            return False
+            return False, perm.replace("<b>", "").replace("</b>", "")[:180]
     sent: Optional[Message] = None
     mirror_posts: list[dict[str, Any]] = []
     for cid in publish_ids:
@@ -3635,8 +3666,7 @@ async def _publish_draft_giveaway_live(
         except TelegramBadRequest as e:
             log.warning("publish giveaway post %s: %s", cid, e)
     if sent is None:
-        await query.answer("Пост не отправился ни в один канал.", show_alert=True)
-        return False
+        return False, "Пост не отправился ни в один канал."
 
     async with _pg_conn() as db:
         await _crosspost_pending_delete_for_giveaway_db(db, gid)
@@ -3651,7 +3681,102 @@ async def _publish_draft_giveaway_live(
             ),
         )
         await db.commit()
+    return True, ""
 
+
+async def _insert_giveaway_clone_row(g: dict[str, Any], uid: int) -> int:
+    """Копия розыгрыша/лотереи как новый черновик (новый набор выигрышных билетов при публикации)."""
+    pub_ids = _publish_chat_ids_from_g(g)
+    if not pub_ids:
+        raise ValueError("no_channels")
+    pc = int(pub_ids[0])
+    mirrors = [int(x) for x in pub_ids[1:]]
+    mir_json = json.dumps(mirrors, ensure_ascii=False)
+    title = (g.get("title") or "").strip() or "Розыгрыш"
+    description = (g.get("description") or "").strip()
+    gtype = (g.get("giveaway_type") or "giveaway").strip()
+    winners_count = int(g.get("winners_count") or 1)
+    ends_at = (g.get("ends_at") or "").strip() or (_utc_now() + timedelta(days=3650)).isoformat()
+    channels_json = (g.get("channels_json") or "[]").strip() or "[]"
+    rq = int(g.get("require_username") or 0)
+    ref = int(g.get("referral_enabled") or 0)
+    ref_step = max(1, min(5, int(g.get("referral_ticket_step") or 1)))
+    sub_only = (g.get("subscribe_only_chat_ids") or "[]").strip() or "[]"
+    pmk = g.get("post_media_kind")
+    pmf = g.get("post_media_file_id")
+    ltc = max(0, min(100, int(g.get("lottery_ticket_count") or 0)))
+    lbt = (g.get("lottery_button_text") or "🎟")[:16]
+    lcc = (g.get("lottery_cell_color") or "blue")[:20]
+    lem = (g.get("lottery_button_custom_emoji_id") or "")[:64]
+    async with _pg_conn() as db:
+        cur = await db.execute(
+            """INSERT INTO giveaways (
+                title, description, giveaway_type, winners_count, ends_at, channels_json,
+                require_username, one_entry_only, referral_enabled, referral_ticket_step,
+                status, post_chat_id, post_message_id, created_by, created_at,
+                mirror_posts_json, mirror_target_chat_ids, mirror_results_json,
+                post_media_kind, post_media_file_id, subscribe_only_chat_ids,
+                lottery_ticket_count, lottery_button_text, lottery_winning_tickets_json, lottery_cell_color,
+                lottery_button_custom_emoji_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'draft', ?, NULL, ?, ?, '[]', ?, NULL, ?, ?, ?, ?, ?, '[]', ?, ?) RETURNING id""",
+            (
+                title,
+                description,
+                gtype,
+                winners_count,
+                ends_at,
+                channels_json,
+                rq,
+                ref,
+                ref_step,
+                pc,
+                uid,
+                _utc_now().isoformat(),
+                mir_json,
+                pmk,
+                pmf,
+                sub_only,
+                ltc,
+                lbt,
+                lcc,
+                lem,
+            ),
+        )
+        row_id = await cur.fetchone()
+        rid: int | None = None
+        if row_id is not None:
+            try:
+                rid = int(row_id["id"])
+            except (KeyError, TypeError, ValueError):
+                rid = None
+        if rid is None:
+            cur2 = await db.execute(
+                "SELECT id FROM giveaways WHERE created_by = ? ORDER BY id DESC LIMIT 1",
+                (uid,),
+            )
+            row_fb = await cur2.fetchone()
+            if row_fb is None:
+                raise RuntimeError("INSERT clone did not return id")
+            rid = int(row_fb["id"])
+        await db.commit()
+        return rid
+
+
+async def _publish_draft_giveaway_live(
+    bot: Bot, query: CallbackQuery, state: FSMContext, gid: int, uid: int
+) -> bool:
+    """Публикует черновик в канал(ы). True — успех, False — уже показали ошибку."""
+    async with _pg_conn() as db:
+        g = await get_giveaway(db, gid)
+    if not g or not _is_giveaway_owner(g, uid):
+        await query.answer("Нет доступа", show_alert=True)
+        return False
+    ok, err = await _publish_draft_giveaway_core(bot, gid)
+    if not ok:
+        await query.answer(err, show_alert=True)
+        return False
+    async with _pg_conn() as db:
+        g = await get_giveaway(db, gid)
     await state.clear()
     await state.update_data(ui_chat_id=query.message.chat.id, ui_message_id=query.message.message_id)
     await _render_callback_screen(
@@ -6605,10 +6730,12 @@ async def cb_dchex(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         "✏️ <b>Дополнительные каналы</b>\n\n"
         "Укажи каналы, на которые тоже нужно подписаться — любым из способов:\n"
         "• <b>Кнопки под строкой ввода</b> «Добавить канал» / «Добавить группу» (выбор чата в Telegram);\n"
-        "• <b>Пересланное сообщение</b> из нужного канала или группы;\n"
-        "• Текстом: <code>@username</code>, <code>t.me/…</code> (кроме приватных <code>t.me/+…</code>), "
+        "• <b>Пересланное сообщение</b> из нужного канала или группы "
+        "(если в канале включено «скрыть источник» при пересылке — id может не прийти);\n"
+        "• Текстом: <code>@username</code>, <code>t.me/…</code>, приватная <code>t.me/+…</code> "
+        "или <code>joinchat</code> при настроенном на сервере userbot (<code>USERBOT_*</code>), "
         "числовой id — несколько через запятую или с новой строки.\n\n"
-        "<i>Приватные инвайт-ссылки бот не превращает в id: добавь канал кнопкой выше или перешли пост оттуда.</i>\n\n"
+        "<i>Без userbot ссылку <code>t.me/+…</code> бот в id не переведёт — тогда id или кнопка «Добавить …».</i>\n\n"
         "Бот запросит согласие у владельцев. После «Проверить согласия» согласованные чаты попадут в условия; "
         "режим «подписка без поста» — в «Управление каналами».",
         InlineKeyboardMarkup(
@@ -6677,21 +6804,32 @@ async def sg_edit_channels_extra(message: Message, state: FSMContext, bot: Bot) 
     extra_ids: list[int] = []
     err_parts: list[str] = []
     for tok in tokens_txt:
+        eid: Optional[int] = None
         if _is_private_invite_link(tok):
-            err_parts.append(
-                f"{html.escape(tok)}: приватные invite-ссылки не поддерживаются Bot API; "
-                "добавь чат через кнопку «Добавить группу» и выбери его из сохранённых."
-            )
-            continue
-        try:
-            if tok.lstrip("-").isdigit():
-                chat = await _get_chat_by_numeric_id(bot, int(tok))
-            else:
-                chat = await bot.get_chat(f"@{tok}")
-            eid = int(chat.id)
-        except Exception:
-            err_parts.append(html.escape(tok))
-            continue
+            eid = await _resolve_private_invite_to_bot_chat_id(tok)
+            if eid is None:
+                if not _userbot_configured():
+                    err_parts.append(
+                        f"{html.escape(tok)}: для <code>t.me/+…</code> на сервере задай "
+                        "<code>USERBOT_API_ID</code>, <code>USERBOT_API_HASH</code>, <code>USERBOT_SESSION</code> "
+                        "или укажи числовой id / добавь чат кнопкой."
+                    )
+                else:
+                    err_parts.append(
+                        f"{html.escape(tok)}: не удалось вступить по ссылке и узнать id "
+                        "(ссылка, лимиты Telegram или userbot не может вступить — смотри логи)."
+                    )
+                continue
+        else:
+            try:
+                if tok.lstrip("-").isdigit():
+                    chat = await _get_chat_by_numeric_id(bot, int(tok))
+                else:
+                    chat = await bot.get_chat(f"@{tok}")
+                eid = int(chat.id)
+            except Exception:
+                err_parts.append(html.escape(tok))
+                continue
         if eid == pc:
             continue
         err_inv, _rec = await _resolve_crosspost_invite_recipients(bot, eid)
@@ -7102,17 +7240,24 @@ async def cb_lottery_pick(query: CallbackQuery, bot: Bot) -> None:
         await query.answer("Некорректный билет.", show_alert=True)
         return
     uid = int(query.from_user.id)
+    is_win = 0
     async with _pg_conn() as db:
         g = await get_giveaway(db, gid)
         if not g or g.get("status") != "active" or not _is_lottery(g):
             await query.answer("Эта лотерея недоступна.", show_alert=True)
             return
+        winners_needed = max(1, min(15, int(g.get("winners_count") or 1)))
         cur_win = await db.execute(
-            "SELECT 1 FROM lottery_picks WHERE giveaway_id = ? AND is_winner = 1 LIMIT 1",
+            "SELECT COUNT(*) AS c FROM lottery_picks WHERE giveaway_id = ? AND is_winner = 1",
             (gid,),
         )
-        if await cur_win.fetchone():
-            await query.answer("Победитель уже определён, билеты больше не выбираются.", show_alert=True)
+        row_w = await cur_win.fetchone()
+        winners_so_far = int(row_w["c"]) if row_w is not None else 0
+        if winners_so_far >= winners_needed:
+            await query.answer(
+                "Все победители уже определены, свободные билеты больше не выбираются.",
+                show_alert=True,
+            )
             return
         total = max(1, min(100, int(g.get("lottery_ticket_count") or 1)))
         if ticket_no < 1 or ticket_no > total:
@@ -7145,6 +7290,8 @@ async def cb_lottery_pick(query: CallbackQuery, bot: Bot) -> None:
         )
         await db.commit()
     try:
+        async with _pg_conn() as dbf:
+            g = await get_giveaway(dbf, gid) or g
         fresh_kb = await _lottery_grid_kb(g)
         await bot.edit_message_reply_markup(
             chat_id=query.message.chat.id,
@@ -7175,6 +7322,20 @@ async def cb_lottery_pick(query: CallbackQuery, bot: Bot) -> None:
         await _broadcast_results_to_mirrors(bot, g, text)
     except Exception as e:
         log.debug("lottery winner publish %s: %s", gid, e)
+    creator_id = int(g.get("created_by") or 0)
+    for dm_uid in {uid, creator_id}:
+        if dm_uid <= 0:
+            continue
+        try:
+            await bot.send_message(
+                dm_uid,
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                link_preview_options=_LINK_PREVIEW_OFF,
+            )
+        except Exception as e:
+            log.debug("lottery winner dm %s gid=%s: %s", dm_uid, gid, e)
     await query.answer("Поздравляем! Вы выиграли 🎉", show_alert=True)
 
 
@@ -7366,8 +7527,9 @@ async def cb_repost(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if not _is_giveaway_owner(g, uid):
         await query.answer("Запостить снова может только автор", show_alert=True)
         return
-    if g.get("status") != "active":
-        await query.answer("Повторный пост только для активного розыгрыша.", show_alert=True)
+    st = (g.get("status") or "").strip()
+    if st == "draft":
+        await query.answer("Сначала опубликуйте этот розыгрыш из черновика.", show_alert=True)
         return
     publish_ids = _publish_chat_ids_from_g(g)
     if not publish_ids:
@@ -7379,68 +7541,39 @@ async def cb_repost(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
             back,
         )
         return
-    for cid in publish_ids:
-        v = await _validate_publish_target_for_send(bot, int(cid))
-        if v:
-            await _render_callback_screen(
-                query,
-                state,
-                bot,
-                f"❌ Не получилось отправить: {v}",
-                back,
-            )
-            return
-    first_sent: Optional[Message] = None
-    new_mirrors: list[dict[str, Any]] = []
-    for cid in publish_ids:
-        try:
-            sm = await _send_giveaway_announcement_to_chat(bot, g, int(cid))
-            if first_sent is None:
-                first_sent = sm
-            else:
-                new_mirrors.append({"chat_id": int(sm.chat.id), "message_id": int(sm.message_id)})
-        except Exception as e:
-            log.warning("repost %s: %s", cid, e)
-    if first_sent is None:
+    try:
+        new_gid = await _insert_giveaway_clone_row(g, uid)
+    except ValueError:
         await _render_callback_screen(
             query,
             state,
             bot,
-            "❌ Не получилось отправить ни в один выбранный канал.",
+            "❌ Не знаю, куда постить — нет выбранных каналов для этого розыгрыша.",
             back,
         )
         return
-    if new_mirrors:
-        by_cid: dict[int, dict[str, Any]] = {}
-        for e in _mirror_posts_list(g):
-            try:
-                by_cid[int(e["chat_id"])] = {
-                    "chat_id": int(e["chat_id"]),
-                    "message_id": int(e["message_id"]),
-                }
-            except Exception:
-                pass
-        for ent in new_mirrors:
-            try:
-                by_cid[int(ent["chat_id"])] = {
-                    "chat_id": int(ent["chat_id"]),
-                    "message_id": int(ent["message_id"]),
-                }
-            except Exception:
-                pass
-        merged = list(by_cid.values())
-        async with _pg_conn() as db:
-            await db.execute(
-                "UPDATE giveaways SET mirror_posts_json = ? WHERE id = ?",
-                (json.dumps(merged, ensure_ascii=False), gid),
-            )
-            await db.commit()
+    ok, err = await _publish_draft_giveaway_core(bot, new_gid)
+    if not ok:
+        await _render_callback_screen(
+            query,
+            state,
+            bot,
+            f"❌ Создан черновик <b>#{new_gid}</b>, но публикация не удалась: {html.escape(err)}",
+            back,
+        )
+        return
+    async with _pg_conn() as db:
+        g_new = await get_giveaway(db, new_gid)
     await _render_callback_screen(
         query,
         state,
         bot,
-        "📣 Пост отправлен во все выбранные каналы публикации.",
-        back,
+        "📣 Опубликован <b>новый</b> такой же розыгрыш "
+        f"<b>#{new_gid}</b> во все выбранные каналы (исходный <b>#{gid}</b> без изменений).",
+        _admin_kb_giveaway(
+            new_gid,
+            can_edit_description=(g_new is not None and not _is_lottery(g_new)),
+        ),
     )
 
 
@@ -7480,6 +7613,64 @@ async def _get_userbot_client() -> Any:
             log.warning("userbot start failed: %s", e)
             return None
     return _userbot_client
+
+
+async def _resolve_private_invite_to_bot_chat_id(invite_text: str) -> Optional[int]:
+    """Приватная invite-ссылка → chat_id в формате Bot API (-100…); через Telethon userbot (Check/ImportChatInvite)."""
+    h = _invite_link_hash(invite_text)
+    if not h:
+        return None
+    if not _userbot_configured():
+        log.warning("resolve invite: userbot not configured (USERBOT_API_ID/HASH/SESSION)")
+        return None
+    ub = await _get_userbot_client()
+    if ub is None:
+        return None
+    try:
+        from telethon.errors import InviteHashExpiredError, InviteHashInvalidError, UserAlreadyParticipantError
+        from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+        from telethon.tl.types import ChatInviteAlready
+        from telethon.utils import get_peer_id
+    except ImportError as e:
+        log.warning("resolve invite: telethon import failed: %s", e)
+        return None
+
+    def _tl_entity_to_bot_id(ent: Any) -> Optional[int]:
+        try:
+            return int(get_peer_id(ent))
+        except Exception:
+            return None
+
+    try:
+        checked = await ub(CheckChatInviteRequest(h))
+        if isinstance(checked, ChatInviteAlready):
+            cid = _tl_entity_to_bot_id(checked.chat)
+            if cid is not None:
+                return cid
+        try:
+            upd = await ub(ImportChatInviteRequest(h))
+        except UserAlreadyParticipantError:
+            checked2 = await ub(CheckChatInviteRequest(h))
+            if isinstance(checked2, ChatInviteAlready):
+                return _tl_entity_to_bot_id(checked2.chat)
+            return None
+        for ent in getattr(upd, "chats", None) or []:
+            cid2 = _tl_entity_to_bot_id(ent)
+            if cid2 is not None:
+                return cid2
+        for u in getattr(upd, "updates", None) or []:
+            inner = getattr(u, "chats", None)
+            if inner:
+                cid3 = _tl_entity_to_bot_id(inner[0])
+                if cid3 is not None:
+                    return cid3
+    except (InviteHashExpiredError, InviteHashInvalidError) as e:
+        log.warning("resolve invite: invalid/expired: %s", e)
+        return None
+    except Exception as e:
+        log.warning("resolve invite failed: %s", e)
+        return None
+    return None
 
 
 async def _userbot_peer_telegram_user_id() -> Optional[int]:
