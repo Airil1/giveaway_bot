@@ -2562,7 +2562,7 @@ def _giveaway_step4_ends_html() -> str:
         f"{_tg_pe(_PE_GW_STEP, '✨')} <b>Шаг 4 из 6</b>\n\n"
         f"{_tg_pe(_PE_GW_PROMPT, '✏️')} Укажите дату окончания розыгрыша (UTC +3, Мск).\n"
         "Формат: <code>31.12.2026 20:00</code>.\n\n"
-        "Или нажмите кнопку ниже: в календаре доступны дни <b>не раньше сегодняшней даты по Москве</b>."
+        "Или нажмите кнопку ниже: в календаре <b>видны только числа с сегодняшнего дня</b> (по Москве)."
     )
 
 
@@ -2597,7 +2597,7 @@ def _merge_pick_publish_under_nav(pick: InlineKeyboardMarkup) -> InlineKeyboardM
 
 
 def _ends_calendar_kb(year: int, month: int) -> InlineKeyboardMarkup:
-    """Календарь: дни раньше сегодняшней даты по МСК недоступны."""
+    """Календарь: номера дней показываются только с сегодняшнего дня по МСК; раньше — пустые ячейки."""
     cal = calendar.monthcalendar(year, month)
     today_msk = _today_msk()
     rows: list[list[InlineKeyboardButton]] = []
@@ -2631,12 +2631,7 @@ def _ends_calendar_kb(year: int, month: int) -> InlineKeyboardMarkup:
                     wrow.append(InlineKeyboardButton(text="·", callback_data="noop"))
                     continue
                 if cell < today_msk:
-                    wrow.append(
-                        InlineKeyboardButton(
-                            text=str(d),
-                            callback_data=f"dt:bd:{year}:{month}:{d}",
-                        )
-                    )
+                    wrow.append(InlineKeyboardButton(text="·", callback_data="noop"))
                 else:
                     wrow.append(
                         InlineKeyboardButton(
@@ -5925,13 +5920,6 @@ async def cb_dt_month_nav(query: CallbackQuery, state: FSMContext, bot: Bot) -> 
         bot,
         "📅 <b>Выберите дату окончания</b>",
         _ends_calendar_kb(y, m),
-    )
-
-
-@router.callback_query(StateFilter(CreateGiveaway.ends_at), F.data.startswith("dt:bd:"))
-async def cb_dt_blocked_day(query: CallbackQuery) -> None:
-    await query.answer(
-        "Нельзя выбрать дату раньше сегодняшнего дня (по Москве).", show_alert=True
     )
 
 
