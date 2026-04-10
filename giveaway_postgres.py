@@ -3049,6 +3049,38 @@ def _admin_kb_giveaway(gid: int, *, can_edit_description: bool = False) -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _reroll_pick_screen_html(gid: int, places: int) -> str:
+    return (
+        f"🔁 <b>Перевыбор победителей</b> (розыгрыш <b>#{gid}</b>)\n\n"
+        f"В итоговом посту сейчас <b>{places}</b> мест (1 — первый победитель, 2 — второй…).\n\n"
+        "• <b>Все места</b> — новый полный список; никто из прежних победителей не участвует в выборе.\n"
+        "• <b>Цифра</b> — перевыбрать только это место, остальные победители остаются.\n\n"
+        "<b>Что перевыбрать?</b>"
+    )
+
+
+def _reroll_pick_kb(gid: int, places: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="🔁 Все места",
+                callback_data=f"rerolla:{gid}",
+            )
+        ],
+    ]
+    pr = max(1, min(places, 15))
+    chunk: list[InlineKeyboardButton] = []
+    for p in range(1, pr + 1):
+        chunk.append(InlineKeyboardButton(text=str(p), callback_data=f"rerollp:{gid}:{p}"))
+        if len(chunk) >= 5:
+            rows.append(chunk)
+            chunk = []
+    if chunk:
+        rows.append(chunk)
+    rows.append([_ikb_back(f"ag:{gid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _draft_giveaway_kb(gid: int) -> InlineKeyboardMarkup:
     rows = [[
         InlineKeyboardButton(
@@ -4979,6 +5011,7 @@ async def _weighted_draw(
     g: dict[str, Any],
     *,
     exclude_user_ids: Optional[set[int]] = None,
+    winners_count_override: Optional[int] = None,
 ) -> list[int]:
     """Перепроверка подписок и выбор победителей по номерам билетов без повторов."""
     exclude_user_ids = exclude_user_ids or set()
@@ -5013,6 +5046,8 @@ async def _weighted_draw(
         return []
 
     winners_count = min(int(g["winners_count"]), len(tickets))
+    if winners_count_override is not None:
+        winners_count = min(max(1, int(winners_count_override)), len(tickets))
     rng = secrets.SystemRandom()
     out: list[int] = []
     items = list(tickets)
@@ -7404,47 +7439,40 @@ async def cb_noop(query: CallbackQuery) -> None:
     await query.answer()
 
 
-@router.callback_query(F.data.startswith("reroll:"))
-async def cb_reroll(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    if not query.from_user:
-        await query.answer()
-        return
-    uid = query.from_user.id
-    gid = int(query.data.split(":")[1])
-    back = _kb_back_admin_giveaway(gid)
-    prev_winners: set[int] = set()
+async def _reroll_load_context(
+    gid: int, uid: int
+) -> tuple[Optional[dict[str, Any]], list[int], Optional[str]]:
     async with _pg_conn() as db:
         g = await get_giveaway(db, gid)
-        if not g:
-            await _render_callback_screen(query, state, bot, "❌ Розыгрыш не найден.", back)
-            return
-        if not _is_giveaway_owner(g, uid):
-            await query.answer("Перевыбрать победителей может только автор", show_alert=True)
-            return
-        if g.get("status") != "active":
-            await query.answer(
-                "Перевыбор только для активного опубликованного розыгрыша.", show_alert=True
-            )
-            return
-        if _is_lottery(g):
-            await query.answer("Для лотереи ручной перевыбор не используется.", show_alert=True)
-            return
-        raw = g.get("last_winners_json")
-        if raw:
-            try:
-                prev_winners = {int(x) for x in json.loads(raw)}
-            except Exception:
-                prev_winners = set()
-        winners = await _weighted_draw(bot, db, g, exclude_user_ids=prev_winners)
-    if not winners:
-        await _render_callback_screen(
-            query,
-            state,
-            bot,
-            f"{_tg_pe(_PE_LOT_DOCWARN, '⚠️')} Сейчас некого выбрать: возможно, все уже выигрывали в переролле или не проходят по условиям подписки.",
-            back,
-        )
-        return
+    if not g:
+        return None, [], "missing"
+    if not _is_giveaway_owner(g, uid):
+        return None, [], "owner"
+    if g.get("status") != "finished":
+        return None, [], "status"
+    if _is_lottery(g):
+        return None, [], "lottery"
+    prev: list[int] = []
+    raw = g.get("last_winners_json")
+    if raw:
+        try:
+            prev = [int(x) for x in json.loads(raw)]
+        except Exception:
+            prev = []
+    if not prev:
+        return None, [], "empty"
+    return g, prev, None
+
+
+async def _reroll_apply_and_publish(
+    query: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    g: dict[str, Any],
+    gid: int,
+    winners: list[int],
+    back: InlineKeyboardMarkup,
+) -> None:
     body = await _format_winners_lines_html(bot, gid, winners)
     gt = _giveaway_title_html(g, gid)
     publ = f"🔁 <b>{gt} — новые победители</b>\n\nВот обновлённый список:\n{body}"
@@ -7459,6 +7487,7 @@ async def cb_reroll(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
             (sent.chat.id, sent.message_id, wjson, json.dumps(mirror_res, ensure_ascii=False), gid),
         )
         await db.commit()
+    await _notify_participants_finished(bot, g, winners)
     await _render_callback_screen(
         query,
         state,
@@ -7466,6 +7495,148 @@ async def cb_reroll(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         "✅ Перевыбрали.\nНовый итог там же, где пост, и в связанных каналах, если настраивали.",
         back,
     )
+
+
+@router.callback_query(F.data.startswith("reroll:"))
+async def cb_reroll_menu(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not query.from_user:
+        await query.answer()
+        return
+    uid = query.from_user.id
+    gid = int(query.data.split(":")[1])
+    back = _kb_back_admin_giveaway(gid)
+    g, prev, err = await _reroll_load_context(gid, uid)
+    if err == "missing":
+        await _render_callback_screen(query, state, bot, "❌ Розыгрыш не найден.", back)
+        return
+    if err == "owner":
+        await query.answer("Перевыбрать победителей может только автор", show_alert=True)
+        return
+    if err == "status":
+        await query.answer(
+            "Перевыбор доступен после подведения итогов (когда уже есть список победителей).",
+            show_alert=True,
+        )
+        return
+    if err == "lottery":
+        await query.answer("Для лотереи ручной перевыбор не используется.", show_alert=True)
+        return
+    if err == "empty":
+        await query.answer("Нет сохранённых победителей для перевыбора.", show_alert=True)
+        return
+    assert g is not None
+    await _render_callback_screen(
+        query,
+        state,
+        bot,
+        _reroll_pick_screen_html(gid, len(prev)),
+        _reroll_pick_kb(gid, len(prev)),
+    )
+
+
+@router.callback_query(F.data.startswith("rerolla:"))
+async def cb_reroll_all(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not query.from_user:
+        await query.answer()
+        return
+    uid = query.from_user.id
+    gid = int(query.data.split(":")[1])
+    back = _kb_back_admin_giveaway(gid)
+    g, prev, err = await _reroll_load_context(gid, uid)
+    if err == "missing":
+        await _render_callback_screen(query, state, bot, "❌ Розыгрыш не найден.", back)
+        return
+    if err == "owner":
+        await query.answer("Перевыбрать победителей может только автор", show_alert=True)
+        return
+    if err == "status":
+        await query.answer(
+            "Перевыбор доступен после подведения итогов (когда уже есть список победителей).",
+            show_alert=True,
+        )
+        return
+    if err == "lottery":
+        await query.answer("Для лотереи ручной перевыбор не используется.", show_alert=True)
+        return
+    if err == "empty":
+        await query.answer("Нет сохранённых победителей для перевыбора.", show_alert=True)
+        return
+    assert g is not None
+    prev_set = set(prev)
+    async with _pg_conn() as db:
+        winners = await _weighted_draw(bot, db, g, exclude_user_ids=prev_set)
+    if not winners:
+        await _render_callback_screen(
+            query,
+            state,
+            bot,
+            f"{_tg_pe(_PE_LOT_DOCWARN, '⚠️')} Сейчас некого выбрать: возможно, все уже выигрывали в переролле или не проходят по условиям подписки.",
+            back,
+        )
+        return
+    await _reroll_apply_and_publish(query, state, bot, g, gid, winners, back)
+
+
+@router.callback_query(F.data.startswith("rerollp:"))
+async def cb_reroll_place(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    if not query.from_user:
+        await query.answer()
+        return
+    uid = query.from_user.id
+    parts = (query.data or "").split(":")
+    if len(parts) != 3:
+        await query.answer()
+        return
+    try:
+        gid = int(parts[1])
+        place = int(parts[2])
+    except ValueError:
+        await query.answer()
+        return
+    back = _kb_back_admin_giveaway(gid)
+    g, prev, err = await _reroll_load_context(gid, uid)
+    if err == "missing":
+        await _render_callback_screen(query, state, bot, "❌ Розыгрыш не найден.", back)
+        return
+    if err == "owner":
+        await query.answer("Перевыбрать победителей может только автор", show_alert=True)
+        return
+    if err == "status":
+        await query.answer(
+            "Перевыбор доступен после подведения итогов (когда уже есть список победителей).",
+            show_alert=True,
+        )
+        return
+    if err == "lottery":
+        await query.answer("Для лотереи ручной перевыбор не используется.", show_alert=True)
+        return
+    if err == "empty":
+        await query.answer("Нет сохранённых победителей для перевыбора.", show_alert=True)
+        return
+    assert g is not None
+    if place < 1 or place > len(prev):
+        await query.answer("Такого места нет в текущем списке.", show_alert=True)
+        return
+    async with _pg_conn() as db:
+        new_one = await _weighted_draw(
+            bot,
+            db,
+            g,
+            exclude_user_ids=set(prev),
+            winners_count_override=1,
+        )
+    if not new_one:
+        await _render_callback_screen(
+            query,
+            state,
+            bot,
+            f"{_tg_pe(_PE_LOT_DOCWARN, '⚠️')} Некого поставить на это место: не осталось подходящих участников (или не хватает людей вне текущего списка победителей).",
+            back,
+        )
+        return
+    new_list = list(prev)
+    new_list[place - 1] = new_one[0]
+    await _reroll_apply_and_publish(query, state, bot, g, gid, new_list, back)
 
 
 @router.callback_query(F.data.startswith("plist:"))
