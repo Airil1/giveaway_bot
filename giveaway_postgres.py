@@ -5880,13 +5880,10 @@ async def sg_ends(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(StateFilter(CreateGiveaway.ends_at), F.data == "dt:open")
 async def cb_dt_open(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    data = await state.get_data()
+    # Всегда открываем календарь на текущем месяце по МСК, без старых cal_year/cal_month из сессии
+    # (иначе после прошлого просмотра мог оставаться далёкий месяц, напр. 04.2026).
     now_local = _utc_now().astimezone(TZ_UTC3)
-    min_y, min_m = now_local.year, now_local.month
-    y = int(data.get("cal_year") or now_local.year)
-    m = int(data.get("cal_month") or now_local.month)
-    if (y, m) < (min_y, min_m):
-        y, m = min_y, min_m
+    y, m = now_local.year, now_local.month
     await state.update_data(cal_year=y, cal_month=m)
     await _render_callback_screen(
         query,
