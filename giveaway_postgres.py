@@ -30,7 +30,7 @@ import os
 import re
 import secrets
 from urllib.parse import unquote
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -402,6 +402,16 @@ def _lottery_publish_pick_html(has_saved_chats: bool) -> str:
 
 
 TZ_UTC3 = timezone(timedelta(hours=3))
+
+
+def _today_msk() -> date:
+    """Сегодняшняя календарная дата в Москве (UTC+3)."""
+    return _utc_now().astimezone(TZ_UTC3).date()
+
+
+def _msk_year_month_now() -> tuple[int, int]:
+    t = _today_msk()
+    return t.year, t.month
 
 
 def _utc_now() -> datetime:
@@ -2552,7 +2562,7 @@ def _giveaway_step4_ends_html() -> str:
         f"{_tg_pe(_PE_GW_STEP, '✨')} <b>Шаг 4 из 6</b>\n\n"
         f"{_tg_pe(_PE_GW_PROMPT, '✏️')} Укажите дату окончания розыгрыша (UTC +3, Мск).\n"
         "Формат: <code>31.12.2026 20:00</code>.\n\n"
-        "Или нажмите кнопку ниже, чтобы выбрать дату и время в календаре."
+        "Или нажмите кнопку ниже: в календаре доступны дни <b>не раньше сегодняшней даты по Москве</b>."
     )
 
 
@@ -2587,7 +2597,9 @@ def _merge_pick_publish_under_nav(pick: InlineKeyboardMarkup) -> InlineKeyboardM
 
 
 def _ends_calendar_kb(year: int, month: int) -> InlineKeyboardMarkup:
+    """Календарь: дни раньше сегодняшней даты по МСК недоступны."""
     cal = calendar.monthcalendar(year, month)
+    today_msk = _today_msk()
     rows: list[list[InlineKeyboardButton]] = []
     rows.append(
         [
@@ -2613,12 +2625,25 @@ def _ends_calendar_kb(year: int, month: int) -> InlineKeyboardMarkup:
             if d == 0:
                 wrow.append(InlineKeyboardButton(text="·", callback_data="noop"))
             else:
-                wrow.append(
-                    InlineKeyboardButton(
-                        text=str(d),
-                        callback_data=f"dt:d:{year}:{month}:{d}",
+                try:
+                    cell = date(year, month, d)
+                except ValueError:
+                    wrow.append(InlineKeyboardButton(text="·", callback_data="noop"))
+                    continue
+                if cell < today_msk:
+                    wrow.append(
+                        InlineKeyboardButton(
+                            text=str(d),
+                            callback_data=f"dt:bd:{year}:{month}:{d}",
+                        )
                     )
-                )
+                else:
+                    wrow.append(
+                        InlineKeyboardButton(
+                            text=str(d),
+                            callback_data=f"dt:d:{year}:{month}:{d}",
+                        )
+                    )
         rows.append(wrow)
     rows.extend(_wizard_nav_kb(show_back=True).inline_keyboard)
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -5832,6 +5857,14 @@ async def sg_ends(message: Message, state: FSMContext) -> None:
             _wizard_nav_kb(show_back=True),
         )
         return
+    if dt <= _utc_now():
+        await _wizard_edit(
+            message.bot,
+            state,
+            "⚠️ Укажите дату и время <b>в будущем</b> (время вводится по Москве, UTC+3).",
+            _wizard_nav_kb(show_back=True),
+        )
+        return
     await state.update_data(ends_at=dt.isoformat(), cal_day=None)
     pub_text, pub_kb = await _advance_to_publish_step_after_end_selected(
         message.bot, state, message.from_user.id
@@ -5849,8 +5882,11 @@ async def sg_ends(message: Message, state: FSMContext) -> None:
 async def cb_dt_open(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     now_local = _utc_now().astimezone(TZ_UTC3)
+    min_y, min_m = now_local.year, now_local.month
     y = int(data.get("cal_year") or now_local.year)
     m = int(data.get("cal_month") or now_local.month)
+    if (y, m) < (min_y, min_m):
+        y, m = min_y, min_m
     await state.update_data(cal_year=y, cal_month=m)
     await _render_callback_screen(
         query,
@@ -5869,11 +5905,17 @@ async def cb_dt_month_nav(query: CallbackQuery, state: FSMContext, bot: Bot) -> 
     except Exception:
         await query.answer()
         return
+    min_y, min_m = _msk_year_month_now()
     if direction == "prev":
         m -= 1
         if m < 1:
             m = 12
             y -= 1
+        if (y, m) < (min_y, min_m):
+            await query.answer(
+                "Раньше текущего месяца по Москве выбрать нельзя.", show_alert=True
+            )
+            return
     else:
         m += 1
         if m > 12:
@@ -5889,21 +5931,33 @@ async def cb_dt_month_nav(query: CallbackQuery, state: FSMContext, bot: Bot) -> 
     )
 
 
+@router.callback_query(StateFilter(CreateGiveaway.ends_at), F.data.startswith("dt:bd:"))
+async def cb_dt_blocked_day(query: CallbackQuery) -> None:
+    await query.answer(
+        "Нельзя выбрать дату раньше сегодняшнего дня (по Москве).", show_alert=True
+    )
+
+
 @router.callback_query(StateFilter(CreateGiveaway.ends_at), F.data.startswith("dt:d:"))
 async def cb_dt_pick_day(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     try:
         _, _, ys, ms, ds = query.data.split(":")
-        day = datetime(int(ys), int(ms), int(ds))
+        picked = date(int(ys), int(ms), int(ds))
     except Exception:
         await query.answer("Не удалось выбрать эту дату", show_alert=True)
         return
-    await state.update_data(cal_day=day.strftime("%Y-%m-%d"))
+    if picked < _today_msk():
+        await query.answer(
+            "Нельзя выбрать дату раньше сегодняшнего дня (по Москве).", show_alert=True
+        )
+        return
+    await state.update_data(cal_day=picked.strftime("%Y-%m-%d"))
     await _render_callback_screen(
         query,
         state,
         bot,
         "📅 Дата выбрана: <b>"
-        + day.strftime("%d.%m.%Y")
+        + picked.strftime("%d.%m.%Y")
         + "</b>\n\n"
         "Теперь отправь время сообщением:\n"
         "<code>16:00</code> или <code>16 00</code>.",
