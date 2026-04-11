@@ -3089,29 +3089,41 @@ def _draft_lottery_kb(gid: int) -> InlineKeyboardMarkup:
 async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, Any]) -> Message:
     """Сообщение как в канале (подпись/медиа), но с клавиатурой управления черновиком."""
     card = _giveaway_public_caption(g)
+    card_safe = _giveaway_public_caption_safe(g)
     kb = _draft_lottery_kb(int(g["id"])) if _is_lottery(g) else _draft_giveaway_kb(int(g["id"]))
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
-    if kind == "photo" and fid:
-        return await bot.send_photo(
-            chat_id, fid, caption=card, reply_markup=kb, parse_mode="HTML"
+
+    async def _send(caption: str) -> Message:
+        if kind == "photo" and fid:
+            return await bot.send_photo(
+                chat_id, fid, caption=caption, reply_markup=kb, parse_mode="HTML"
+            )
+        if kind == "animation" and fid:
+            return await bot.send_animation(
+                chat_id, fid, caption=caption, reply_markup=kb, parse_mode="HTML"
+            )
+        if kind == "video" and fid:
+            return await bot.send_video(
+                chat_id, fid, caption=caption, reply_markup=kb, parse_mode="HTML"
+            )
+        return await bot.send_message(
+            chat_id,
+            caption,
+            reply_markup=kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            link_preview_options=_LINK_PREVIEW_OFF,
         )
-    if kind == "animation" and fid:
-        return await bot.send_animation(
-            chat_id, fid, caption=card, reply_markup=kb, parse_mode="HTML"
+
+    try:
+        return await _send(card)
+    except TelegramBadRequest as e:
+        log.warning(
+            "draft UI: caption with user premium/tg-emoji failed (%s), retry plain",
+            e,
         )
-    if kind == "video" and fid:
-        return await bot.send_video(
-            chat_id, fid, caption=card, reply_markup=kb, parse_mode="HTML"
-        )
-    return await bot.send_message(
-        chat_id,
-        card,
-        reply_markup=kb,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        link_preview_options=_LINK_PREVIEW_OFF,
-    )
+        return await _send(card_safe)
 
 
 async def _render_draft_giveaway_screen(
@@ -3126,14 +3138,14 @@ async def _render_draft_giveaway_screen(
         return
     await query.answer()
     cid, mid = query.message.chat.id, query.message.message_id
+    sent = await _send_draft_giveaway_ui_message(bot, cid, g)
+    await _remember_ui(state, sent.chat.id, sent.message_id)
     try:
         await bot.delete_message(cid, mid)
     except TelegramBadRequest:
         pass
     except Exception as e:
-        log.debug("replace draft screen: %s", e)
-    sent = await _send_draft_giveaway_ui_message(bot, cid, g)
-    await _remember_ui(state, sent.chat.id, sent.message_id)
+        log.debug("replace draft screen delete old: %s", e)
 
 
 async def _present_draft_giveaway_after_wizard(
@@ -3153,13 +3165,13 @@ async def _present_draft_giveaway_after_wizard(
         except Exception as e:
             log.debug("present draft fallback msg: %s", e)
         return
+    sent = await _send_draft_giveaway_ui_message(bot, chat_id, g)
+    await _remember_ui(state, sent.chat.id, sent.message_id)
     if old_message_id is not None:
         try:
             await bot.delete_message(chat_id, int(old_message_id))
         except Exception:
             pass
-    sent = await _send_draft_giveaway_ui_message(bot, chat_id, g)
-    await _remember_ui(state, sent.chat.id, sent.message_id)
 
 
 async def _insert_draft_giveaway_row(
@@ -3331,6 +3343,47 @@ def _giveaway_public_caption(g: dict[str, Any]) -> str:
     return (
         f"{_tg_pe(_PE_GW_STEP1, '🎁')} {_restore_escaped_tg_emoji_html((g.get('title') or '').strip())}\n\n"
         f"{_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
+        f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
+        f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
+        f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
+        "чтобы попасть в розыгрыш"
+    )
+
+
+def _giveaway_public_caption_safe(g: dict[str, Any]) -> str:
+    """Тот же каркас, что у `_giveaway_public_caption`, но название/описание без чужих <tg-emoji>.
+
+    Исходящие сообщения бота с custom emoji из набора *другого* аккаунта часто дают TelegramBadRequest;
+    тогда показываем текст призов без premium-иконок (как в `_user_stored_html_as_safe_plain_escape`).
+    """
+    if _is_lottery(g):
+        tickets = max(1, min(100, int(g.get("lottery_ticket_count") or 1)))
+        title_esc = _user_stored_html_as_safe_plain_escape((g.get("title") or "").strip(), max_len=400)
+        desc_esc = _user_stored_html_as_safe_plain_escape((g.get("description") or "").strip(), max_len=1200)
+        hint = (
+            "<blockquote expandable>Нажми на номер билета ниже - если попадёшь в выигрышный квадрат, "
+            "бот опубликует отдельный пост с победителем.</blockquote>"
+        )
+        body = (
+            f"🎰 {title_esc}\n\n"
+            f"Количество билетов: <b>{tickets}</b>\n"
+            f"Победителей: <b>{g['winners_count']}</b>\n\n"
+            f"{hint}"
+        )
+        if desc_esc:
+            return (
+                f"🎰 {title_esc}\n\n"
+                f"{desc_esc}\n\n"
+                f"Количество билетов: <b>{tickets}</b>\n"
+                f"Победителей: <b>{g['winners_count']}</b>\n\n"
+                f"{hint}"
+            )
+        return body
+    title_esc = _user_stored_html_as_safe_plain_escape((g.get("title") or "").strip(), max_len=400)
+    desc_esc = _user_stored_html_as_safe_plain_escape(g.get("description") or "", max_len=1200)
+    return (
+        f"{_tg_pe(_PE_GW_STEP1, '🎁')} {title_esc}\n\n"
+        f"{desc_esc}\n\n"
         f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
         f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
         f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
