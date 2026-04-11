@@ -3485,7 +3485,7 @@ def _giveaway_public_caption_plain(g: dict[str, Any]) -> str:
 async def _edit_giveaway_public_message(
     bot: Bot, chat_id: int, message_id: int, g: dict[str, Any]
 ) -> None:
-    """Обновляет текст/подпись одного поста розыгрыша в канале (основной или дубль)."""
+    """Обновляет текст/подпись одного поста розыгрыша (канал/группа, основной или дубль)."""
     card = _giveaway_public_caption(g)
     kb = await _build_public_participant_kb(bot, g)
     kind = (g.get("post_media_kind") or "").strip()
@@ -3493,7 +3493,12 @@ async def _edit_giveaway_public_message(
     use_entities = False
     try:
         ch = await bot.get_chat(int(chat_id))
-        use_entities = getattr(ch, "type", "") in ("channel", "group", "supergroup")
+        t = getattr(ch, "type", None)
+        cts = getattr(t, "value", t) if t is not None else ""
+        if not isinstance(cts, str):
+            cts = str(cts)
+        # Как при публикации: в канале — entities; в группе/супергруппе — HTML с <tg-emoji> (вшитые premium).
+        use_entities = cts == "channel"
     except Exception:
         use_entities = False
     card_text, card_entities = _html_to_text_and_custom_entities(card)
@@ -3662,6 +3667,13 @@ async def _send_giveaway_announcement_to_chat(
         pass
     extra: dict[str, Any] = dict(_forum_send_kwargs(ch))
 
+    chat_type_str = ""
+    if ch is not None:
+        t = getattr(ch, "type", None)
+        chat_type_str = getattr(t, "value", t) if t is not None else ""
+        if not isinstance(chat_type_str, str):
+            chat_type_str = str(chat_type_str)
+
     async def _send_entities(caption_html: str) -> Message:
         ct, ce = _html_to_text_and_custom_entities(caption_html)
         if kind == "photo" and fid:
@@ -3765,6 +3777,23 @@ async def _send_giveaway_announcement_to_chat(
             **extra,
         )
 
+    # Каналы: сначала entities (custom emoji стабильно). Группы/супергруппы: сначала HTML с <tg-emoji>,
+    # иначе вшитые premium-иконки бота через entities часто отображаются как пустые/битые.
+    if chat_type_str in ("group", "supergroup"):
+        publish_steps = (
+            ("html_full", lambda: _send_html(card)),
+            ("html_safe", lambda: _send_html(card_safe)),
+            ("entities", lambda: _send_entities(card)),
+            ("plain", lambda: _send_plain(card_plain)),
+        )
+    else:
+        publish_steps = (
+            ("entities", lambda: _send_entities(card)),
+            ("html_safe", lambda: _send_html(card_safe)),
+            ("html_full", lambda: _send_html(card)),
+            ("plain", lambda: _send_plain(card_plain)),
+        )
+
     last_err: Optional[BaseException] = None
     for round_i in range(2):
         if round_i == 1:
@@ -3773,12 +3802,7 @@ async def _send_giveaway_announcement_to_chat(
                 "giveaway public post retry without forum thread_id chat=%s",
                 publish_cid,
             )
-        for label, fn in (
-            ("entities", lambda: _send_entities(card)),
-            ("html_safe", lambda: _send_html(card_safe)),
-            ("html_full", lambda: _send_html(card)),
-            ("plain", lambda: _send_plain(card_plain)),
-        ):
+        for label, fn in publish_steps:
             try:
                 return await fn()
             except TelegramBadRequest as e:
