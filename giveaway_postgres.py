@@ -3090,11 +3090,12 @@ async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, A
     """Сообщение как в канале (подпись/медиа), но с клавиатурой управления черновиком."""
     card = _giveaway_public_caption(g)
     card_safe = _giveaway_public_caption_safe(g)
+    card_plain = _giveaway_public_caption_plain(g)
     kb = _draft_lottery_kb(int(g["id"])) if _is_lottery(g) else _draft_giveaway_kb(int(g["id"]))
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
 
-    async def _send(caption: str) -> Message:
+    async def _send_html(caption: str) -> Message:
         if kind == "photo" and fid:
             return await bot.send_photo(
                 chat_id, fid, caption=caption, reply_markup=kb, parse_mode="HTML"
@@ -3116,14 +3117,54 @@ async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, A
             link_preview_options=_LINK_PREVIEW_OFF,
         )
 
-    try:
-        return await _send(card)
-    except TelegramBadRequest as e:
-        log.warning(
-            "draft UI: caption with user premium/tg-emoji failed (%s), retry plain",
-            e,
+    async def _send_plaintext(caption: str) -> Message:
+        cap = _truncate_telegram_text(caption, 1024 if (kind in ("photo", "animation", "video") and fid) else 4096)
+        if kind == "photo" and fid:
+            return await bot.send_photo(chat_id, fid, caption=cap, reply_markup=kb)
+        if kind == "animation" and fid:
+            return await bot.send_animation(chat_id, fid, caption=cap, reply_markup=kb)
+        if kind == "video" and fid:
+            return await bot.send_video(chat_id, fid, caption=cap, reply_markup=kb)
+        return await bot.send_message(
+            chat_id,
+            cap,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+            link_preview_options=_LINK_PREVIEW_OFF,
         )
-        return await _send(card_safe)
+
+    for label, cap, fn in (
+        ("full HTML", card, _send_html),
+        ("safe HTML", card_safe, _send_html),
+        ("plain text", card_plain, _send_plaintext),
+    ):
+        try:
+            return await fn(cap)
+        except Exception as e:
+            log.warning("draft UI: %s send failed: %s", label, e)
+    raise RuntimeError("draft UI: all send variants failed")
+
+
+async def _notify_draft_created_fallback(bot: Bot, uid: int, gid: int) -> None:
+    """Если экран черновика не удалось отрисовать — хотя бы подтверждение и переход в список."""
+    try:
+        await bot.send_message(
+            uid,
+            f"✅ Черновик <b>#{gid}</b> создан. Открой «Мои розыгрыши».",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="📂 Мои розыгрыши",
+                            callback_data="adm_list",
+                        )
+                    ]
+                ]
+            ),
+        )
+    except Exception as send_e:
+        log.debug("fallback notify draft created: %s", send_e)
 
 
 async def _render_draft_giveaway_screen(
@@ -3389,6 +3430,56 @@ def _giveaway_public_caption_safe(g: dict[str, Any]) -> str:
         f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
         "чтобы попасть в розыгрыш"
     )
+
+
+def _truncate_telegram_text(s: str, max_len: int) -> str:
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
+def _giveaway_public_caption_plain(g: dict[str, Any]) -> str:
+    """Текст черновика без HTML-тегов — если даже safe HTML не принимает API (редкие случаи)."""
+    if _is_lottery(g):
+        tickets = max(1, min(100, int(g.get("lottery_ticket_count") or 1)))
+        title = _html_to_plain_text_keep_linebreaks(
+            _restore_escaped_tg_emoji_html((g.get("title") or "").strip())
+        ).strip()
+        desc = _html_to_plain_text_keep_linebreaks(
+            _restore_escaped_tg_emoji_html((g.get("description") or "").strip())
+        ).strip()
+        hint = (
+            "Нажми на номер билета ниже — если попадёшь в выигрышный квадрат, "
+            "бот опубликует отдельный пост с победителем."
+        )
+        if desc:
+            return _truncate_telegram_text(
+                f"🎰 {title}\n\n{desc}\n\n"
+                f"Количество билетов: {tickets}\n"
+                f"Победителей: {g['winners_count']}\n\n"
+                f"{hint}",
+                1024,
+            )
+        return _truncate_telegram_text(
+            f"🎰 {title}\n\n"
+            f"Количество билетов: {tickets}\n"
+            f"Победителей: {g['winners_count']}\n\n"
+            f"{hint}",
+            1024,
+        )
+    title = _html_to_plain_text_keep_linebreaks(
+        _restore_escaped_tg_emoji_html((g.get("title") or "").strip())
+    ).strip()
+    desc = _html_to_plain_text_keep_linebreaks(
+        _restore_escaped_tg_emoji_html((g.get("description") or "").strip())
+    ).strip()
+    body = (
+        f"🎁 {title}\n\n{desc}\n\n"
+        f"Победителей: {g['winners_count']}\n"
+        f"До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
+        "Жми «Участвовать» под этим постом и выполни все условия, чтобы попасть в розыгрыш"
+    )
+    return _truncate_telegram_text(body, 4096)
 
 
 async def _edit_giveaway_public_message(
@@ -6006,7 +6097,8 @@ async def _finalize_create_giveaway_draft(
     kind = (data.get("giveaway_type") or "giveaway").strip()
     required = ("winners_count",)
     if kind == "lottery":
-        required = required + ("description", "lottery_ticket_count", "lottery_button_custom_emoji_id")
+        # lottery_button_custom_emoji_id может отсутствовать в FSM до шага кнопки — в БД подставляется ""
+        required = required + ("description", "lottery_ticket_count")
     else:
         required = required + ("title", "description", "ends_at")
     if not all(data.get(k) is not None for k in required):
@@ -6091,7 +6183,11 @@ async def _complete_wizard_media_and_show_draft(
         g = await get_giveaway(db, gid)
     chat_id = int(ui_cid) if ui_cid is not None else message.chat.id
     old_mid = int(ui_mid) if ui_mid is not None else None
-    await _present_draft_giveaway_after_wizard(bot, state, chat_id, old_mid, g)
+    try:
+        await _present_draft_giveaway_after_wizard(bot, state, chat_id, old_mid, g)
+    except Exception as e:
+        log.exception("present draft after media wizard: %s", e)
+        await _notify_draft_created_fallback(bot, uid, gid)
     try:
         await message.delete()
     except Exception:
@@ -6123,7 +6219,11 @@ async def cb_wmedia_no(query: CallbackQuery, state: FSMContext, bot: Bot) -> Non
     await state.clear()
     async with _pg_conn() as db:
         g = await get_giveaway(db, gid)
-    await _render_draft_giveaway_screen(query, state, bot, g)
+    try:
+        await _render_draft_giveaway_screen(query, state, bot, g)
+    except Exception as e:
+        log.exception("render draft screen after wizard: %s", e)
+        await _notify_draft_created_fallback(bot, uid, gid)
 
 
 @router.callback_query(StateFilter(CreateGiveaway.media_prompt), F.data == "wmedia:yes")
