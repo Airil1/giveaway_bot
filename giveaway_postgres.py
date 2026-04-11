@@ -3574,6 +3574,21 @@ async def _edit_giveaway_public_message(
         log.debug("edit giveaway public msg %s/%s: %s", chat_id, message_id, e)
 
 
+def _forum_send_kwargs(chat: Any) -> dict[str, Any]:
+    """Форум-супергруппа: иногда без message_thread_id (тема «Общий») пост не появляется."""
+    if chat is None:
+        return {}
+    if not getattr(chat, "is_forum", None):
+        return {}
+    tid = getattr(chat, "general_forum_topic_id", None)
+    if tid is None:
+        return {}
+    try:
+        return {"message_thread_id": int(tid)}
+    except (TypeError, ValueError):
+        return {}
+
+
 async def _refresh_giveaway_public_posts(bot: Bot, g: dict[str, Any]) -> None:
     """Перерисовывает подпись во всех постах (основной + зеркала)."""
     pc, pm = g.get("post_chat_id"), g.get("post_message_id")
@@ -3635,71 +3650,148 @@ async def _send_giveaway_announcement_to_chat(
         m.message_id = int(sent_userbot["message_id"])
         return m  # type: ignore[return-value]
     card = _giveaway_public_caption(g)
+    card_safe = _giveaway_public_caption_safe(g)
+    card_plain = _giveaway_public_caption_plain(g)
     kb_main = await _build_public_participant_kb(bot, g)
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
-    # В каналах и группах надёжнее caption/text + entities (custom emoji), чем HTML с <tg-emoji>:
-    # в супергруппах parse_mode=HTML с premium-emoji часто даёт TelegramBadRequest.
-    use_entities = False
+    ch: Optional[Chat] = None
     try:
         ch = await bot.get_chat(int(publish_cid))
-        use_entities = getattr(ch, "type", "") in ("channel", "group", "supergroup")
     except Exception:
-        use_entities = False
-    card_text, card_entities = _html_to_text_and_custom_entities(card)
-    if kind == "photo" and fid:
-        if use_entities:
+        pass
+    extra: dict[str, Any] = dict(_forum_send_kwargs(ch))
+
+    async def _send_entities(caption_html: str) -> Message:
+        ct, ce = _html_to_text_and_custom_entities(caption_html)
+        if kind == "photo" and fid:
             return await bot.send_photo(
                 publish_cid,
                 fid,
-                caption=card_text,
-                caption_entities=card_entities or None,
+                caption=ct,
+                caption_entities=ce or None,
                 reply_markup=kb_main,
+                **extra,
             )
-        return await bot.send_photo(
-            publish_cid, fid, caption=card, reply_markup=kb_main, parse_mode="HTML"
-        )
-    if kind == "animation" and fid:
-        if use_entities:
+        if kind == "animation" and fid:
             return await bot.send_animation(
                 publish_cid,
                 fid,
-                caption=card_text,
-                caption_entities=card_entities or None,
+                caption=ct,
+                caption_entities=ce or None,
                 reply_markup=kb_main,
+                **extra,
             )
-        return await bot.send_animation(
-            publish_cid, fid, caption=card, reply_markup=kb_main, parse_mode="HTML"
-        )
-    if kind == "video" and fid:
-        if use_entities:
+        if kind == "video" and fid:
             return await bot.send_video(
                 publish_cid,
                 fid,
-                caption=card_text,
-                caption_entities=card_entities or None,
+                caption=ct,
+                caption_entities=ce or None,
                 reply_markup=kb_main,
+                **extra,
             )
-        return await bot.send_video(
-            publish_cid, fid, caption=card, reply_markup=kb_main, parse_mode="HTML"
-        )
-    if use_entities:
         return await bot.send_message(
             publish_cid,
-            card_text,
-            entities=card_entities or None,
+            ct,
+            entities=ce or None,
             reply_markup=kb_main,
             disable_web_page_preview=True,
             link_preview_options=_LINK_PREVIEW_OFF,
+            **extra,
         )
-    return await bot.send_message(
-        publish_cid,
-        card,
-        reply_markup=kb_main,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        link_preview_options=_LINK_PREVIEW_OFF,
-    )
+
+    async def _send_html(caption_html: str) -> Message:
+        if kind == "photo" and fid:
+            return await bot.send_photo(
+                publish_cid,
+                fid,
+                caption=caption_html,
+                reply_markup=kb_main,
+                parse_mode="HTML",
+                **extra,
+            )
+        if kind == "animation" and fid:
+            return await bot.send_animation(
+                publish_cid,
+                fid,
+                caption=caption_html,
+                reply_markup=kb_main,
+                parse_mode="HTML",
+                **extra,
+            )
+        if kind == "video" and fid:
+            return await bot.send_video(
+                publish_cid,
+                fid,
+                caption=caption_html,
+                reply_markup=kb_main,
+                parse_mode="HTML",
+                **extra,
+            )
+        return await bot.send_message(
+            publish_cid,
+            caption_html,
+            reply_markup=kb_main,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            link_preview_options=_LINK_PREVIEW_OFF,
+            **extra,
+        )
+
+    async def _send_plain(caption_plain: str) -> Message:
+        cap = _truncate_telegram_text(
+            caption_plain,
+            1024 if (kind in ("photo", "animation", "video") and fid) else 4096,
+        )
+        if kind == "photo" and fid:
+            return await bot.send_photo(
+                publish_cid, fid, caption=cap, reply_markup=kb_main, **extra
+            )
+        if kind == "animation" and fid:
+            return await bot.send_animation(
+                publish_cid, fid, caption=cap, reply_markup=kb_main, **extra
+            )
+        if kind == "video" and fid:
+            return await bot.send_video(
+                publish_cid, fid, caption=cap, reply_markup=kb_main, **extra
+            )
+        return await bot.send_message(
+            publish_cid,
+            cap,
+            reply_markup=kb_main,
+            disable_web_page_preview=True,
+            link_preview_options=_LINK_PREVIEW_OFF,
+            **extra,
+        )
+
+    last_err: Optional[BaseException] = None
+    for round_i in range(2):
+        if round_i == 1:
+            extra.clear()
+            log.warning(
+                "giveaway public post retry without forum thread_id chat=%s",
+                publish_cid,
+            )
+        for label, fn in (
+            ("entities", lambda: _send_entities(card)),
+            ("html_safe", lambda: _send_html(card_safe)),
+            ("html_full", lambda: _send_html(card)),
+            ("plain", lambda: _send_plain(card_plain)),
+        ):
+            try:
+                return await fn()
+            except TelegramBadRequest as e:
+                log.warning(
+                    "giveaway public post chat=%s step=%s: %s",
+                    publish_cid,
+                    label,
+                    e,
+                )
+                last_err = e
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("giveaway public post: empty attempts")
 
 
 async def _publish_draft_giveaway_core(bot: Bot, gid: int) -> tuple[bool, str]:
@@ -3746,7 +3838,7 @@ async def _publish_draft_giveaway_core(bot: Bot, gid: int) -> tuple[bool, str]:
                 sent = sm
             else:
                 mirror_posts.append({"chat_id": sm.chat.id, "message_id": sm.message_id})
-        except TelegramBadRequest as e:
+        except Exception as e:
             log.warning("publish giveaway post %s: %s", cid, e)
     if sent is None:
         return False, "Пост не отправился ни в один из выбранных чатов (канал/группа)."
