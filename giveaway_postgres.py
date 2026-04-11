@@ -2241,7 +2241,6 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
     """
     Convert HTML with <tg-emoji> to plain text + custom_emoji entities.
     Other HTML formatting is flattened to plain text for channel entity-mode sends.
-    Как в giveaway.py (sqlite).
     """
     out_parts: list[str] = []
     out_entities: list[MessageEntity] = []
@@ -2250,9 +2249,7 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
         r'<tg-emoji\s+emoji-id="(\d+)"\s*>(.*?)</tg-emoji>',
         flags=re.IGNORECASE | re.DOTALL,
     )
-    src = _sanitize_tg_emoji_html_for_send(
-        _restore_escaped_tg_emoji_html(src_html or "")
-    )
+    src = _restore_escaped_tg_emoji_html(src_html or "")
     for m in pat.finditer(src):
         out_parts.append(_html_to_plain_text_keep_linebreaks(src[pos:m.start()]))
         eid = (m.group(1) or "").strip()
@@ -2297,148 +2294,61 @@ def _restore_escaped_tg_emoji_html(src: str) -> str:
     return s
 
 
-_TG_EMOJI_OPEN_TAG = re.compile(r"<tg-emoji([^>]*)>(.*?)</tg-emoji>", re.IGNORECASE | re.DOTALL)
-
-
-def _tg_attr_emoji_id(attrs: str) -> str:
-    a = attrs or ""
-    for pat in (
-        r'emoji-id\s*=\s*"(\d+)"',
-        r"emoji-id\s*=\s*'(\d+)'",
-        r"emoji-id\s*=\s*(\d+)",
-    ):
-        m = re.search(pat, a, re.IGNORECASE)
-        if m:
-            return (m.group(1) or "").strip()
-    return ""
-
-
-def _is_valid_custom_emoji_id_for_bot_api(eid: str) -> bool:
-    """Bot API отклоняет нецифровые/пустые/подозрительно длинные custom_emoji_id."""
-    s = (eid or "").strip()
-    if not s.isdigit():
-        return False
-    return 1 <= len(s) <= 22
-
-
-def _sanitize_tg_emoji_html_for_send(html_src: str) -> str:
-    """
-    Невалидный emoji-id в <tg-emoji> → один видимый символ без тега.
-    Иначе Telegram: can't parse entities / Invalid custom emoji identifier.
-    """
-    s = html_src or ""
-    for _ in range(512):
-        m = _TG_EMOJI_OPEN_TAG.search(s)
-        if not m:
-            break
-        attrs, inner = m.group(1) or "", m.group(2) or ""
-        eid = _tg_attr_emoji_id(attrs)
-        glyph = _html_to_plain_text_keep_linebreaks(inner)[:1] or "·"
-        if _is_valid_custom_emoji_id_for_bot_api(eid):
-            rep = f'<tg-emoji emoji-id="{eid}">{html.escape(glyph, quote=False)}</tg-emoji>'
-        else:
-            rep = html.escape(glyph, quote=False)
-        s = s[: m.start()] + rep + s[m.end() :]
-    return s
-
-
-def _strip_all_tg_emoji_html_to_plain_glyphs(html_src: str) -> str:
-    """Все <tg-emoji> убрать, оставить один символ (fallback при отказе API на custom emoji)."""
-    s = html_src or ""
-    for _ in range(512):
-        m = _TG_EMOJI_OPEN_TAG.search(s)
-        if not m:
-            break
-        inner = m.group(2) or ""
-        glyph = _html_to_plain_text_keep_linebreaks(inner)[:1] or "·"
-        s = s[: m.start()] + html.escape(glyph, quote=False) + s[m.end() :]
-    return s
-
-
-def _telegram_custom_emoji_or_parse_error(exc: BaseException) -> bool:
-    s = (str(exc) or "").lower()
-    return any(
-        x in s
-        for x in (
-            "invalid custom emoji",
-            "can't parse entities",
-            "cannot parse entities",
-            "parse entities",
-        )
-    )
-
-
 def _message_html_preserve_custom_emoji(message: Message) -> str:
     """
     Prefer Telegram-provided html_text, but if custom emoji entities exist and
     tg-emoji tags are missing, rebuild text with explicit <tg-emoji>.
-    Как в giveaway.py (sqlite).
     """
-    plain = (message.text or message.caption or "")
-    if not (plain or "").strip():
-        return ""
-    # Только сущности того поля, откуда взят текст (иначе unparse/смещения ломаются).
-    entities = list(
-        (message.entities if message.text is not None else message.caption_entities) or []
-    )
-    html_text = ""
-    try:
-        html_text = (message.html_text or "").strip()
-    except Exception as e:
-        log.debug("message.html_text failed: %s", e)
+    html_text = ((getattr(message, "html_text", None) or "").strip()
+                 or (getattr(message, "html_caption", None) or "").strip())
     if html_text and "<emoji id=" in html_text:
-        # aiogram/Telegram may provide custom emoji as <emoji id="...">X</emoji>;
-        # Bot API HTML for sending requires <tg-emoji emoji-id="...">X</tg-emoji>.
         html_text = re.sub(
             r'<emoji id="(\d+)">(.*?)</emoji>',
             r'<tg-emoji emoji-id="\1">\2</tg-emoji>',
             html_text,
             flags=re.IGNORECASE | re.DOTALL,
         )
+    entities = list(getattr(message, "entities", None) or []) + list(
+        getattr(message, "caption_entities", None) or []
+    )
+    plain = (message.text or message.caption or "")
+    if not plain:
+        return _restore_escaped_tg_emoji_html(html_text or html.escape(message.text or ""))
     has_custom = any(_is_custom_emoji_entity(e) for e in entities)
     if not has_custom:
-        return _restore_escaped_tg_emoji_html(html_text or html.escape(plain, quote=False))
+        return _restore_escaped_tg_emoji_html(html_text or html.escape(plain))
     if "<tg-emoji" in html_text:
         return html_text
 
-    # Fallback: preserve custom emoji tags in plain text.
-    try:
-        out = html.escape(plain, quote=False)
-        custom_entities: list[tuple[int, int, str]] = []
-        for e in entities:
-            if not _is_custom_emoji_entity(e):
-                continue
-            cid = str(getattr(e, "custom_emoji_id", "") or "").strip()
-            if not cid:
-                continue
-            off = int(getattr(e, "offset", 0) or 0)
-            ln = int(getattr(e, "length", 0) or 0)
-            if ln <= 0:
-                continue
-            s = _utf16_offset_to_py_index(plain, off)
-            t = _utf16_offset_to_py_index(plain, off + ln)
-            if t < s:
-                continue
-            custom_entities.append((s, t, cid))
-        if not custom_entities:
-            return html_text or out
+    out = html.escape(plain, quote=False)
+    custom_entities: list[tuple[int, int, str]] = []
+    for e in entities:
+        if not _is_custom_emoji_entity(e):
+            continue
+        cid = str(getattr(e, "custom_emoji_id", "") or "").strip()
+        if not cid:
+            continue
+        off = int(getattr(e, "offset", 0) or 0)
+        ln = int(getattr(e, "length", 0) or 0)
+        if ln <= 0:
+            continue
+        s = _utf16_offset_to_py_index(plain, off)
+        t = _utf16_offset_to_py_index(plain, off + ln)
+        custom_entities.append((s, t, cid))
+    if not custom_entities:
+        return html_text or out
 
-        parts: list[str] = []
-        cursor = 0
-        for s, t, cid in sorted(custom_entities, key=lambda x: x[0]):
-            if s < cursor:
-                continue
-            parts.append(html.escape(plain[cursor:s], quote=False))
-            glyph = plain[s:t] or "•"
-            parts.append(
-                f'<tg-emoji emoji-id="{cid}">{html.escape(glyph[:1], quote=False)}</tg-emoji>'
-            )
-            cursor = t
-        parts.append(html.escape(plain[cursor:], quote=False))
-        return _restore_escaped_tg_emoji_html("".join(parts))
-    except Exception as e:
-        log.warning("message_html_preserve_custom_emoji rebuild failed: %s", e)
-        return html.escape(plain, quote=False)
+    parts: list[str] = []
+    cursor = 0
+    for s, t, cid in sorted(custom_entities, key=lambda x: x[0]):
+        if s < cursor:
+            continue
+        parts.append(html.escape(plain[cursor:s], quote=False))
+        glyph = plain[s:t] or "•"
+        parts.append(f'<tg-emoji emoji-id="{cid}">{html.escape(glyph[:1], quote=False)}</tg-emoji>')
+        cursor = t
+    parts.append(html.escape(plain[cursor:], quote=False))
+    return _restore_escaped_tg_emoji_html("".join(parts))
 
 
 async def _dispatch_crosspost_admin_requests(
@@ -3410,15 +3320,15 @@ def _giveaway_public_caption(g: dict[str, Any]) -> str:
             f"{hint}"
         )
         if desc_html:
-            return _sanitize_tg_emoji_html_for_send(
+            return (
                 f"🎰 {title_html}\n\n"
                 f"{desc_html}\n\n"
                 f"Количество билетов: <b>{tickets}</b>\n"
                 f"Победителей: <b>{g['winners_count']}</b>\n\n"
                 f"{hint}"
             )
-        return _sanitize_tg_emoji_html_for_send(body)
-    return _sanitize_tg_emoji_html_for_send(
+        return body
+    return (
         f"{_tg_pe(_PE_GW_STEP1, '🎁')} {_restore_escaped_tg_emoji_html((g.get('title') or '').strip())}\n\n"
         f"{_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
         f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
@@ -3426,70 +3336,6 @@ def _giveaway_public_caption(g: dict[str, Any]) -> str:
         f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
         "чтобы попасть в розыгрыш"
     )
-
-
-async def _edit_channel_caption_with_emoji_fallback(
-    bot: Bot,
-    chat_id: int,
-    message_id: int,
-    card: str,
-    card_text: str,
-    card_entities: list[MessageEntity],
-    reply_markup: InlineKeyboardMarkup,
-) -> None:
-    try:
-        await bot.edit_message_caption(
-            chat_id=chat_id,
-            message_id=message_id,
-            caption=card_text,
-            caption_entities=card_entities or None,
-            reply_markup=reply_markup,
-        )
-    except TelegramBadRequest as e:
-        if not _telegram_custom_emoji_or_parse_error(e):
-            raise
-        log.warning("edit_message_caption: fallback without custom emoji: %s", e)
-        await bot.edit_message_caption(
-            chat_id=chat_id,
-            message_id=message_id,
-            caption=_strip_all_tg_emoji_html_to_plain_glyphs(card),
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-        )
-
-
-async def _edit_channel_text_with_emoji_fallback(
-    bot: Bot,
-    chat_id: int,
-    message_id: int,
-    card: str,
-    card_text: str,
-    card_entities: list[MessageEntity],
-    reply_markup: InlineKeyboardMarkup,
-) -> None:
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=card_text,
-            entities=card_entities or None,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-            link_preview_options=_LINK_PREVIEW_OFF,
-        )
-    except TelegramBadRequest as e:
-        if not _telegram_custom_emoji_or_parse_error(e):
-            raise
-        log.warning("edit_message_text: fallback without custom emoji: %s", e)
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=_strip_all_tg_emoji_html_to_plain_glyphs(card),
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            link_preview_options=_LINK_PREVIEW_OFF,
-        )
 
 
 async def _edit_giveaway_public_message(
@@ -3510,14 +3356,12 @@ async def _edit_giveaway_public_message(
     try:
         if kind == "photo" and fid:
             if is_channel:
-                await _edit_channel_caption_with_emoji_fallback(
-                    bot,
-                    chat_id,
-                    message_id,
-                    card,
-                    card_text,
-                    card_entities,
-                    kb,
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=card_text,
+                    caption_entities=card_entities or None,
+                    reply_markup=kb,
                 )
             else:
                 await bot.edit_message_caption(
@@ -3529,14 +3373,12 @@ async def _edit_giveaway_public_message(
                 )
         elif kind == "animation" and fid:
             if is_channel:
-                await _edit_channel_caption_with_emoji_fallback(
-                    bot,
-                    chat_id,
-                    message_id,
-                    card,
-                    card_text,
-                    card_entities,
-                    kb,
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=card_text,
+                    caption_entities=card_entities or None,
+                    reply_markup=kb,
                 )
             else:
                 await bot.edit_message_caption(
@@ -3548,14 +3390,12 @@ async def _edit_giveaway_public_message(
                 )
         elif kind == "video" and fid:
             if is_channel:
-                await _edit_channel_caption_with_emoji_fallback(
-                    bot,
-                    chat_id,
-                    message_id,
-                    card,
-                    card_text,
-                    card_entities,
-                    kb,
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=card_text,
+                    caption_entities=card_entities or None,
+                    reply_markup=kb,
                 )
             else:
                 await bot.edit_message_caption(
@@ -3567,14 +3407,14 @@ async def _edit_giveaway_public_message(
                 )
         else:
             if is_channel:
-                await _edit_channel_text_with_emoji_fallback(
-                    bot,
-                    chat_id,
-                    message_id,
-                    card,
-                    card_text,
-                    card_entities,
-                    kb,
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=card_text,
+                    entities=card_entities or None,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                    link_preview_options=_LINK_PREVIEW_OFF,
                 )
             else:
                 await bot.edit_message_text(
@@ -3602,127 +3442,6 @@ async def _refresh_giveaway_public_posts(bot: Bot, g: dict[str, Any]) -> None:
             )
         except Exception as e:
             log.debug("refresh mirror: %s", e)
-
-
-async def _send_channel_photo_emoji_fb(
-    bot: Bot,
-    publish_cid: int,
-    fid: str,
-    card: str,
-    card_text: str,
-    card_entities: list[MessageEntity],
-    kb_main: InlineKeyboardMarkup,
-) -> Message:
-    try:
-        return await bot.send_photo(
-            publish_cid,
-            fid,
-            caption=card_text,
-            caption_entities=card_entities or None,
-            reply_markup=kb_main,
-        )
-    except TelegramBadRequest as e:
-        if not _telegram_custom_emoji_or_parse_error(e):
-            raise
-        log.warning("send_photo: fallback without custom emoji: %s", e)
-        return await bot.send_photo(
-            publish_cid,
-            fid,
-            caption=_strip_all_tg_emoji_html_to_plain_glyphs(card),
-            reply_markup=kb_main,
-            parse_mode="HTML",
-        )
-
-
-async def _send_channel_animation_emoji_fb(
-    bot: Bot,
-    publish_cid: int,
-    fid: str,
-    card: str,
-    card_text: str,
-    card_entities: list[MessageEntity],
-    kb_main: InlineKeyboardMarkup,
-) -> Message:
-    try:
-        return await bot.send_animation(
-            publish_cid,
-            fid,
-            caption=card_text,
-            caption_entities=card_entities or None,
-            reply_markup=kb_main,
-        )
-    except TelegramBadRequest as e:
-        if not _telegram_custom_emoji_or_parse_error(e):
-            raise
-        log.warning("send_animation: fallback without custom emoji: %s", e)
-        return await bot.send_animation(
-            publish_cid,
-            fid,
-            caption=_strip_all_tg_emoji_html_to_plain_glyphs(card),
-            reply_markup=kb_main,
-            parse_mode="HTML",
-        )
-
-
-async def _send_channel_video_emoji_fb(
-    bot: Bot,
-    publish_cid: int,
-    fid: str,
-    card: str,
-    card_text: str,
-    card_entities: list[MessageEntity],
-    kb_main: InlineKeyboardMarkup,
-) -> Message:
-    try:
-        return await bot.send_video(
-            publish_cid,
-            fid,
-            caption=card_text,
-            caption_entities=card_entities or None,
-            reply_markup=kb_main,
-        )
-    except TelegramBadRequest as e:
-        if not _telegram_custom_emoji_or_parse_error(e):
-            raise
-        log.warning("send_video: fallback without custom emoji: %s", e)
-        return await bot.send_video(
-            publish_cid,
-            fid,
-            caption=_strip_all_tg_emoji_html_to_plain_glyphs(card),
-            reply_markup=kb_main,
-            parse_mode="HTML",
-        )
-
-
-async def _send_channel_message_emoji_fb(
-    bot: Bot,
-    publish_cid: int,
-    card: str,
-    card_text: str,
-    card_entities: list[MessageEntity],
-    kb_main: InlineKeyboardMarkup,
-) -> Message:
-    try:
-        return await bot.send_message(
-            publish_cid,
-            card_text,
-            entities=card_entities or None,
-            reply_markup=kb_main,
-            disable_web_page_preview=True,
-            link_preview_options=_LINK_PREVIEW_OFF,
-        )
-    except TelegramBadRequest as e:
-        if not _telegram_custom_emoji_or_parse_error(e):
-            raise
-        log.warning("send_message: fallback without custom emoji: %s", e)
-        return await bot.send_message(
-            publish_cid,
-            _strip_all_tg_emoji_html_to_plain_glyphs(card),
-            reply_markup=kb_main,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-            link_preview_options=_LINK_PREVIEW_OFF,
-        )
 
 
 async def _send_giveaway_announcement_to_chat(
@@ -3784,31 +3503,48 @@ async def _send_giveaway_announcement_to_chat(
     card_text, card_entities = _html_to_text_and_custom_entities(card)
     if kind == "photo" and fid:
         if is_channel:
-            return await _send_channel_photo_emoji_fb(
-                bot, publish_cid, fid, card, card_text, card_entities, kb_main
+            return await bot.send_photo(
+                publish_cid,
+                fid,
+                caption=card_text,
+                caption_entities=card_entities or None,
+                reply_markup=kb_main,
             )
         return await bot.send_photo(
             publish_cid, fid, caption=card, reply_markup=kb_main, parse_mode="HTML"
         )
     if kind == "animation" and fid:
         if is_channel:
-            return await _send_channel_animation_emoji_fb(
-                bot, publish_cid, fid, card, card_text, card_entities, kb_main
+            return await bot.send_animation(
+                publish_cid,
+                fid,
+                caption=card_text,
+                caption_entities=card_entities or None,
+                reply_markup=kb_main,
             )
         return await bot.send_animation(
             publish_cid, fid, caption=card, reply_markup=kb_main, parse_mode="HTML"
         )
     if kind == "video" and fid:
         if is_channel:
-            return await _send_channel_video_emoji_fb(
-                bot, publish_cid, fid, card, card_text, card_entities, kb_main
+            return await bot.send_video(
+                publish_cid,
+                fid,
+                caption=card_text,
+                caption_entities=card_entities or None,
+                reply_markup=kb_main,
             )
         return await bot.send_video(
             publish_cid, fid, caption=card, reply_markup=kb_main, parse_mode="HTML"
         )
     if is_channel:
-        return await _send_channel_message_emoji_fb(
-            bot, publish_cid, card, card_text, card_entities, kb_main
+        return await bot.send_message(
+            publish_cid,
+            card_text,
+            entities=card_entities or None,
+            reply_markup=kb_main,
+            disable_web_page_preview=True,
+            link_preview_options=_LINK_PREVIEW_OFF,
         )
     return await bot.send_message(
         publish_cid,
