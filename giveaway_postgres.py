@@ -2301,8 +2301,18 @@ def _message_html_preserve_custom_emoji(message: Message) -> str:
     tg-emoji tags are missing, rebuild text with explicit <tg-emoji>.
     Как в giveaway.py (sqlite).
     """
-    html_text = ((getattr(message, "html_text", None) or "").strip()
-                 or (getattr(message, "html_caption", None) or "").strip())
+    plain = (message.text or message.caption or "")
+    if not (plain or "").strip():
+        return ""
+    # Только сущности того поля, откуда взят текст (иначе unparse/смещения ломаются).
+    entities = list(
+        (message.entities if message.text is not None else message.caption_entities) or []
+    )
+    html_text = ""
+    try:
+        html_text = (message.html_text or "").strip()
+    except Exception as e:
+        log.debug("message.html_text failed: %s", e)
     if html_text and "<emoji id=" in html_text:
         # aiogram/Telegram may provide custom emoji as <emoji id="...">X</emoji>;
         # Bot API HTML for sending requires <tg-emoji emoji-id="...">X</tg-emoji>.
@@ -2312,49 +2322,50 @@ def _message_html_preserve_custom_emoji(message: Message) -> str:
             html_text,
             flags=re.IGNORECASE | re.DOTALL,
         )
-    entities = list(getattr(message, "entities", None) or []) + list(
-        getattr(message, "caption_entities", None) or []
-    )
-    plain = (message.text or message.caption or "")
-    if not plain:
-        return _restore_escaped_tg_emoji_html(html_text or html.escape(message.text or ""))
     has_custom = any(_is_custom_emoji_entity(e) for e in entities)
     if not has_custom:
-        return _restore_escaped_tg_emoji_html(html_text or html.escape(plain))
+        return _restore_escaped_tg_emoji_html(html_text or html.escape(plain, quote=False))
     if "<tg-emoji" in html_text:
         return html_text
 
     # Fallback: preserve custom emoji tags in plain text.
-    out = html.escape(plain, quote=False)
-    custom_entities: list[tuple[int, int, str]] = []
-    for e in entities:
-        if not _is_custom_emoji_entity(e):
-            continue
-        cid = str(getattr(e, "custom_emoji_id", "") or "").strip()
-        if not cid:
-            continue
-        off = int(getattr(e, "offset", 0) or 0)
-        ln = int(getattr(e, "length", 0) or 0)
-        if ln <= 0:
-            continue
-        s = _utf16_offset_to_py_index(plain, off)
-        t = _utf16_offset_to_py_index(plain, off + ln)
-        custom_entities.append((s, t, cid))
-    if not custom_entities:
-        return html_text or out
+    try:
+        out = html.escape(plain, quote=False)
+        custom_entities: list[tuple[int, int, str]] = []
+        for e in entities:
+            if not _is_custom_emoji_entity(e):
+                continue
+            cid = str(getattr(e, "custom_emoji_id", "") or "").strip()
+            if not cid:
+                continue
+            off = int(getattr(e, "offset", 0) or 0)
+            ln = int(getattr(e, "length", 0) or 0)
+            if ln <= 0:
+                continue
+            s = _utf16_offset_to_py_index(plain, off)
+            t = _utf16_offset_to_py_index(plain, off + ln)
+            if t < s:
+                continue
+            custom_entities.append((s, t, cid))
+        if not custom_entities:
+            return html_text or out
 
-    # Rebuild from original text to avoid index drift on escaped output.
-    parts: list[str] = []
-    cursor = 0
-    for s, t, cid in sorted(custom_entities, key=lambda x: x[0]):
-        if s < cursor:
-            continue
-        parts.append(html.escape(plain[cursor:s], quote=False))
-        glyph = plain[s:t] or "•"
-        parts.append(f'<tg-emoji emoji-id="{cid}">{html.escape(glyph[:1], quote=False)}</tg-emoji>')
-        cursor = t
-    parts.append(html.escape(plain[cursor:], quote=False))
-    return _restore_escaped_tg_emoji_html("".join(parts))
+        parts: list[str] = []
+        cursor = 0
+        for s, t, cid in sorted(custom_entities, key=lambda x: x[0]):
+            if s < cursor:
+                continue
+            parts.append(html.escape(plain[cursor:s], quote=False))
+            glyph = plain[s:t] or "•"
+            parts.append(
+                f'<tg-emoji emoji-id="{cid}">{html.escape(glyph[:1], quote=False)}</tg-emoji>'
+            )
+            cursor = t
+        parts.append(html.escape(plain[cursor:], quote=False))
+        return _restore_escaped_tg_emoji_html("".join(parts))
+    except Exception as e:
+        log.warning("message_html_preserve_custom_emoji rebuild failed: %s", e)
+        return html.escape(plain, quote=False)
 
 
 async def _dispatch_crosspost_admin_requests(
