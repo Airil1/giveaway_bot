@@ -2321,12 +2321,12 @@ def _is_valid_custom_emoji_id_for_bot_api(eid: str) -> bool:
     return 1 <= len(s) <= 22
 
 
-def _sanitize_tg_emoji_html_for_send(html: str) -> str:
+def _sanitize_tg_emoji_html_for_send(html_src: str) -> str:
     """
     Невалидный emoji-id в <tg-emoji> → один видимый символ без тега.
     Иначе Telegram: can't parse entities / Invalid custom emoji identifier.
     """
-    s = html or ""
+    s = html_src or ""
     for _ in range(512):
         m = _TG_EMOJI_OPEN_TAG.search(s)
         if not m:
@@ -2342,9 +2342,9 @@ def _sanitize_tg_emoji_html_for_send(html: str) -> str:
     return s
 
 
-def _strip_all_tg_emoji_html_to_plain_glyphs(html: str) -> str:
+def _strip_all_tg_emoji_html_to_plain_glyphs(html_src: str) -> str:
     """Все <tg-emoji> убрать, оставить один символ (fallback при отказе API на custom emoji)."""
-    s = html or ""
+    s = html_src or ""
     for _ in range(512):
         m = _TG_EMOJI_OPEN_TAG.search(s)
         if not m:
