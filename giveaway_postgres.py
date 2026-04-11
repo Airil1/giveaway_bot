@@ -2242,9 +2242,8 @@ def _html_to_plain_text_keep_linebreaks(src: str) -> str:
 
 def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageEntity]]:
     """
-    Convert HTML with <tg-emoji> to plain text + custom_emoji entities.
-    Other HTML formatting is flattened to plain text for channel entity-mode sends.
-    Как в giveaway.py (sqlite); перед разбором — санитайз id для Bot API.
+    HTML с <tg-emoji> → плоский текст + сущности custom_emoji (UTF-16 offset/length).
+    Порядок атрибутов в теге любой (_TG_EMOJI_OPEN_TAG). Без parse_mode — основной путь для премиум-эмодзи.
     """
     src = _sanitize_tg_emoji_html_for_send(
         _restore_escaped_tg_emoji_html(src_html or "")
@@ -2252,17 +2251,15 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
     out_parts: list[str] = []
     out_entities: list[MessageEntity] = []
     pos = 0
-    pat = re.compile(
-        r'<tg-emoji\s+emoji-id="(\d+)"\s*>(.*?)</tg-emoji>',
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    for m in pat.finditer(src):
+    for m in _TG_EMOJI_OPEN_TAG.finditer(src):
         out_parts.append(_html_to_plain_text_keep_linebreaks(src[pos:m.start()]))
-        eid = (m.group(1) or "").strip()
-        glyph = _html_to_plain_text_keep_linebreaks(m.group(2) or "")[:1] or "•"
+        attrs = (m.group(1) or "").strip()
+        inner = m.group(2) or ""
+        eid = _tg_open_attrs_emoji_id(attrs)
+        glyph = _html_to_plain_text_keep_linebreaks(inner)[:1] or "•"
         offset = _utf16_len("".join(out_parts))
         out_parts.append(glyph)
-        if eid and _is_valid_custom_emoji_id_for_api(eid):
+        if _is_valid_custom_emoji_id_for_api(eid):
             out_entities.append(
                 MessageEntity(
                     type="custom_emoji",
@@ -3214,6 +3211,8 @@ async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, A
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
     plain_fb = html.escape(_html_to_plain_text_keep_linebreaks(card))[:4096]
+    card_text, card_entities = _html_to_text_and_custom_entities(card)
+    use_ce = bool(card_entities)
 
     async def _fallback_text() -> Message:
         return await bot.send_message(
@@ -3224,7 +3223,19 @@ async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, A
             link_preview_options=_LINK_PREVIEW_OFF,
         )
 
+    # Custom emoji: Bot API надёжнее через caption_entities / entities без parse_mode, чем <tg-emoji> в HTML.
     if kind == "photo" and fid:
+        if use_ce:
+            try:
+                return await bot.send_photo(
+                    chat_id,
+                    fid,
+                    caption=card_text,
+                    caption_entities=card_entities,
+                    reply_markup=kb,
+                )
+            except TelegramBadRequest as e:
+                log.warning("draft send_photo caption_entities failed: %s", e)
         try:
             return await bot.send_photo(
                 chat_id, fid, caption=card, reply_markup=kb, parse_mode="HTML"
@@ -3242,6 +3253,17 @@ async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, A
             cap = plain_fb[:1024]
             return await bot.send_photo(chat_id, fid, caption=cap, reply_markup=kb)
     if kind == "animation" and fid:
+        if use_ce:
+            try:
+                return await bot.send_animation(
+                    chat_id,
+                    fid,
+                    caption=card_text,
+                    caption_entities=card_entities,
+                    reply_markup=kb,
+                )
+            except TelegramBadRequest as e:
+                log.warning("draft send_animation caption_entities failed: %s", e)
         try:
             return await bot.send_animation(
                 chat_id, fid, caption=card, reply_markup=kb, parse_mode="HTML"
@@ -3259,6 +3281,17 @@ async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, A
             cap = plain_fb[:1024]
             return await bot.send_animation(chat_id, fid, caption=cap, reply_markup=kb)
     if kind == "video" and fid:
+        if use_ce:
+            try:
+                return await bot.send_video(
+                    chat_id,
+                    fid,
+                    caption=card_text,
+                    caption_entities=card_entities,
+                    reply_markup=kb,
+                )
+            except TelegramBadRequest as e:
+                log.warning("draft send_video caption_entities failed: %s", e)
         try:
             return await bot.send_video(
                 chat_id, fid, caption=card, reply_markup=kb, parse_mode="HTML"
@@ -3275,6 +3308,18 @@ async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, A
             log.warning("draft send_video HTML failed, plain caption: %s", e)
             cap = plain_fb[:1024]
             return await bot.send_video(chat_id, fid, caption=cap, reply_markup=kb)
+    if use_ce:
+        try:
+            return await bot.send_message(
+                chat_id,
+                card_text,
+                entities=card_entities,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+                link_preview_options=_LINK_PREVIEW_OFF,
+            )
+        except TelegramBadRequest as e:
+            log.warning("draft send_message entities failed: %s", e)
     try:
         return await bot.send_message(
             chat_id,
@@ -3564,21 +3609,16 @@ async def _edit_giveaway_public_message(
     kb = await _build_public_participant_kb(bot, g)
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
-    is_channel = False
-    try:
-        ch = await bot.get_chat(int(chat_id))
-        is_channel = getattr(ch, "type", "") == "channel"
-    except Exception:
-        is_channel = False
     card_text, card_entities = _html_to_text_and_custom_entities(card)
+    use_ce = bool(card_entities)
     try:
         if kind == "photo" and fid:
-            if is_channel:
+            if use_ce:
                 await bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=message_id,
                     caption=card_text,
-                    caption_entities=card_entities or None,
+                    caption_entities=card_entities,
                     reply_markup=kb,
                 )
             else:
@@ -3590,12 +3630,12 @@ async def _edit_giveaway_public_message(
                     parse_mode="HTML",
                 )
         elif kind == "animation" and fid:
-            if is_channel:
+            if use_ce:
                 await bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=message_id,
                     caption=card_text,
-                    caption_entities=card_entities or None,
+                    caption_entities=card_entities,
                     reply_markup=kb,
                 )
             else:
@@ -3607,12 +3647,12 @@ async def _edit_giveaway_public_message(
                     parse_mode="HTML",
                 )
         elif kind == "video" and fid:
-            if is_channel:
+            if use_ce:
                 await bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=message_id,
                     caption=card_text,
-                    caption_entities=card_entities or None,
+                    caption_entities=card_entities,
                     reply_markup=kb,
                 )
             else:
@@ -3624,12 +3664,12 @@ async def _edit_giveaway_public_message(
                     parse_mode="HTML",
                 )
         else:
-            if is_channel:
+            if use_ce:
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
                     text=card_text,
-                    entities=card_entities or None,
+                    entities=card_entities,
                     reply_markup=kb,
                     disable_web_page_preview=True,
                     link_preview_options=_LINK_PREVIEW_OFF,
@@ -3716,12 +3756,6 @@ async def _send_giveaway_announcement_to_chat(
     kb_main = await _build_public_participant_kb(bot, g)
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
-    is_channel = False
-    try:
-        ch = await bot.get_chat(int(publish_cid))
-        is_channel = getattr(ch, "type", "") == "channel"
-    except Exception:
-        is_channel = False
     card_text, card_entities = _html_to_text_and_custom_entities(card)
 
     async def _send_announcement_attempt(*, strip_custom_emoji: bool) -> Message:
@@ -3731,67 +3765,67 @@ async def _send_giveaway_announcement_to_chat(
         if strip_custom_emoji:
             ct, ce = _html_to_text_and_custom_entities(c_html)
         if kind == "photo" and fid:
-            if is_channel:
+            if strip_custom_emoji or not ce:
                 return await bot.send_photo(
                     publish_cid,
                     fid,
-                    caption=ct,
-                    caption_entities=ce or None,
+                    caption=c_html,
                     reply_markup=kb_main,
+                    parse_mode="HTML",
                 )
             return await bot.send_photo(
                 publish_cid,
                 fid,
-                caption=c_html,
+                caption=ct,
+                caption_entities=ce,
                 reply_markup=kb_main,
-                parse_mode="HTML",
             )
         if kind == "animation" and fid:
-            if is_channel:
+            if strip_custom_emoji or not ce:
                 return await bot.send_animation(
                     publish_cid,
                     fid,
-                    caption=ct,
-                    caption_entities=ce or None,
+                    caption=c_html,
                     reply_markup=kb_main,
+                    parse_mode="HTML",
                 )
             return await bot.send_animation(
                 publish_cid,
                 fid,
-                caption=c_html,
+                caption=ct,
+                caption_entities=ce,
                 reply_markup=kb_main,
-                parse_mode="HTML",
             )
         if kind == "video" and fid:
-            if is_channel:
+            if strip_custom_emoji or not ce:
                 return await bot.send_video(
                     publish_cid,
                     fid,
-                    caption=ct,
-                    caption_entities=ce or None,
+                    caption=c_html,
                     reply_markup=kb_main,
+                    parse_mode="HTML",
                 )
             return await bot.send_video(
                 publish_cid,
                 fid,
-                caption=c_html,
+                caption=ct,
+                caption_entities=ce,
                 reply_markup=kb_main,
-                parse_mode="HTML",
             )
-        if is_channel:
+        if strip_custom_emoji or not ce:
             return await bot.send_message(
                 publish_cid,
-                ct,
-                entities=ce or None,
+                c_html,
                 reply_markup=kb_main,
+                parse_mode="HTML",
                 disable_web_page_preview=True,
                 link_preview_options=_LINK_PREVIEW_OFF,
             )
         return await bot.send_message(
             publish_cid,
-            c_html,
+            ct,
+            entities=ce,
             reply_markup=kb_main,
-            parse_mode="HTML",
             disable_web_page_preview=True,
             link_preview_options=_LINK_PREVIEW_OFF,
         )
