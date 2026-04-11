@@ -3490,16 +3490,16 @@ async def _edit_giveaway_public_message(
     kb = await _build_public_participant_kb(bot, g)
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
-    is_channel = False
+    use_entities = False
     try:
         ch = await bot.get_chat(int(chat_id))
-        is_channel = getattr(ch, "type", "") == "channel"
+        use_entities = getattr(ch, "type", "") in ("channel", "group", "supergroup")
     except Exception:
-        is_channel = False
+        use_entities = False
     card_text, card_entities = _html_to_text_and_custom_entities(card)
     try:
         if kind == "photo" and fid:
-            if is_channel:
+            if use_entities:
                 await bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -3516,7 +3516,7 @@ async def _edit_giveaway_public_message(
                     parse_mode="HTML",
                 )
         elif kind == "animation" and fid:
-            if is_channel:
+            if use_entities:
                 await bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -3533,7 +3533,7 @@ async def _edit_giveaway_public_message(
                     parse_mode="HTML",
                 )
         elif kind == "video" and fid:
-            if is_channel:
+            if use_entities:
                 await bot.edit_message_caption(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -3550,7 +3550,7 @@ async def _edit_giveaway_public_message(
                     parse_mode="HTML",
                 )
         else:
-            if is_channel:
+            if use_entities:
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=message_id,
@@ -3638,15 +3638,17 @@ async def _send_giveaway_announcement_to_chat(
     kb_main = await _build_public_participant_kb(bot, g)
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
-    is_channel = False
+    # В каналах и группах надёжнее caption/text + entities (custom emoji), чем HTML с <tg-emoji>:
+    # в супергруппах parse_mode=HTML с premium-emoji часто даёт TelegramBadRequest.
+    use_entities = False
     try:
         ch = await bot.get_chat(int(publish_cid))
-        is_channel = getattr(ch, "type", "") == "channel"
+        use_entities = getattr(ch, "type", "") in ("channel", "group", "supergroup")
     except Exception:
-        is_channel = False
+        use_entities = False
     card_text, card_entities = _html_to_text_and_custom_entities(card)
     if kind == "photo" and fid:
-        if is_channel:
+        if use_entities:
             return await bot.send_photo(
                 publish_cid,
                 fid,
@@ -3658,7 +3660,7 @@ async def _send_giveaway_announcement_to_chat(
             publish_cid, fid, caption=card, reply_markup=kb_main, parse_mode="HTML"
         )
     if kind == "animation" and fid:
-        if is_channel:
+        if use_entities:
             return await bot.send_animation(
                 publish_cid,
                 fid,
@@ -3670,7 +3672,7 @@ async def _send_giveaway_announcement_to_chat(
             publish_cid, fid, caption=card, reply_markup=kb_main, parse_mode="HTML"
         )
     if kind == "video" and fid:
-        if is_channel:
+        if use_entities:
             return await bot.send_video(
                 publish_cid,
                 fid,
@@ -3681,7 +3683,7 @@ async def _send_giveaway_announcement_to_chat(
         return await bot.send_video(
             publish_cid, fid, caption=card, reply_markup=kb_main, parse_mode="HTML"
         )
-    if is_channel:
+    if use_entities:
         return await bot.send_message(
             publish_cid,
             card_text,
@@ -3747,7 +3749,7 @@ async def _publish_draft_giveaway_core(bot: Bot, gid: int) -> tuple[bool, str]:
         except TelegramBadRequest as e:
             log.warning("publish giveaway post %s: %s", cid, e)
     if sent is None:
-        return False, "Пост не отправился ни в один канал."
+        return False, "Пост не отправился ни в один из выбранных чатов (канал/группа)."
 
     async with _pg_conn() as db:
         await _crosspost_pending_delete_for_giveaway_db(db, gid)
