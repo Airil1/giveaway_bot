@@ -2241,6 +2241,7 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
     """
     Convert HTML with <tg-emoji> to plain text + custom_emoji entities.
     Other HTML formatting is flattened to plain text for channel entity-mode sends.
+    Как в giveaway.py (sqlite).
     """
     out_parts: list[str] = []
     out_entities: list[MessageEntity] = []
@@ -2249,8 +2250,9 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
         r'<tg-emoji\s+emoji-id="(\d+)"\s*>(.*?)</tg-emoji>',
         flags=re.IGNORECASE | re.DOTALL,
     )
-    for m in pat.finditer(src_html or ""):
-        out_parts.append(_html_to_plain_text_keep_linebreaks(src_html[pos:m.start()]))
+    src = _restore_escaped_tg_emoji_html(src_html or "")
+    for m in pat.finditer(src):
+        out_parts.append(_html_to_plain_text_keep_linebreaks(src[pos:m.start()]))
         eid = (m.group(1) or "").strip()
         glyph = _html_to_plain_text_keep_linebreaks(m.group(2) or "")[:1] or "•"
         offset = _utf16_len("".join(out_parts))
@@ -2265,7 +2267,7 @@ def _html_to_text_and_custom_entities(src_html: str) -> tuple[str, list[MessageE
                 )
             )
         pos = m.end()
-    out_parts.append(_html_to_plain_text_keep_linebreaks((src_html or "")[pos:]))
+    out_parts.append(_html_to_plain_text_keep_linebreaks(src[pos:]))
     text = "".join(out_parts)
     return text, out_entities
 
@@ -2297,6 +2299,7 @@ def _message_html_preserve_custom_emoji(message: Message) -> str:
     """
     Prefer Telegram-provided html_text, but if custom emoji entities exist and
     tg-emoji tags are missing, rebuild text with explicit <tg-emoji>.
+    Как в giveaway.py (sqlite).
     """
     html_text = ((getattr(message, "html_text", None) or "").strip()
                  or (getattr(message, "html_caption", None) or "").strip())
