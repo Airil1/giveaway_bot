@@ -2412,61 +2412,26 @@ def _strip_inline_kb_custom_emoji(kb: InlineKeyboardMarkup) -> InlineKeyboardMar
 
 
 def _message_html_preserve_custom_emoji(message: Message) -> str:
-    """
-    Prefer Telegram-provided html_text, but if custom emoji entities exist and
-    tg-emoji tags are missing, rebuild text with explicit <tg-emoji>.
-    Как в giveaway.py (sqlite).
-    """
-    html_text = ((getattr(message, "html_text", None) or "").strip()
-                 or (getattr(message, "html_caption", None) or "").strip())
-    if html_text and "<emoji id=" in html_text:
-        html_text = re.sub(
+    """HTML из сообщения: жирный/ссылки и Premium custom emoji (<tg-emoji>) через entities Telegram."""
+    plain = message.text or message.caption or ""
+    if not (plain or "").strip():
+        return ""
+    try:
+        # То же, что Message.html_text: HtmlDecoration.unparse + CUSTOM_EMOJI → <tg-emoji emoji-id="…">
+        src = message.html_text
+    except Exception as e:
+        log.debug("message.html_text failed: %s", e)
+        src = ""
+    if not (src or "").strip():
+        src = html.escape(plain, quote=False)
+    if "<emoji id=" in src:
+        src = re.sub(
             r'<emoji id="(\d+)">(.*?)</emoji>',
             r'<tg-emoji emoji-id="\1">\2</tg-emoji>',
-            html_text,
+            src,
             flags=re.IGNORECASE | re.DOTALL,
         )
-    entities = list(getattr(message, "entities", None) or []) + list(
-        getattr(message, "caption_entities", None) or []
-    )
-    plain = (message.text or message.caption or "")
-    if not plain:
-        return _restore_escaped_tg_emoji_html(html_text or html.escape(message.text or ""))
-    has_custom = any(_is_custom_emoji_entity(e) for e in entities)
-    if not has_custom:
-        return _restore_escaped_tg_emoji_html(html_text or html.escape(plain))
-    if "<tg-emoji" in html_text:
-        return html_text
-
-    out = html.escape(plain, quote=False)
-    custom_entities: list[tuple[int, int, str]] = []
-    for e in entities:
-        if not _is_custom_emoji_entity(e):
-            continue
-        cid = str(getattr(e, "custom_emoji_id", "") or "").strip()
-        if not cid:
-            continue
-        off = int(getattr(e, "offset", 0) or 0)
-        ln = int(getattr(e, "length", 0) or 0)
-        if ln <= 0:
-            continue
-        s = _utf16_offset_to_py_index(plain, off)
-        t = _utf16_offset_to_py_index(plain, off + ln)
-        custom_entities.append((s, t, cid))
-    if not custom_entities:
-        return html_text or out
-
-    parts: list[str] = []
-    cursor = 0
-    for s, t, cid in sorted(custom_entities, key=lambda x: x[0]):
-        if s < cursor:
-            continue
-        parts.append(html.escape(plain[cursor:s], quote=False))
-        glyph = plain[s:t] or "•"
-        parts.append(f'<tg-emoji emoji-id="{cid}">{html.escape(glyph[:1], quote=False)}</tg-emoji>')
-        cursor = t
-    parts.append(html.escape(plain[cursor:], quote=False))
-    return _restore_escaped_tg_emoji_html("".join(parts))
+    return _restore_escaped_tg_emoji_html(src.strip())
 
 
 async def _dispatch_crosspost_admin_requests(
