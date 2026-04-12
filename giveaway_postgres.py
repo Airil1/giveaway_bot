@@ -8,8 +8,8 @@ Telegram-бот для розыгрышей (aiogram 3 + PostgreSQL).
 Опционально: START_WELCOME_PHOTO — путь к PNG главного экрана (абсолютный или относительно каталога скрипта; иначе ./start_welcome.png).
 ID премиум-эмодзи в кнопках/шаблоне (_PE_*): с этого бота (см. /emojiid).
 
-Логика: участвовать может кто угодно; создавать и постить — только админы выбранного канала/группы;
-управлять конкретным розыгрышем может только тот, кто его создал.
+Логика: участвовать может кто угодно; создавать и постить — любой администратор выбранного канала/группы
+(не только владелец); управлять конкретным розыгрышем может только тот, кто его создал.
 
 Бот должен уметь писать в чаты постов; для проверки подписок ему нужен доступ к участникам.
 
@@ -1984,13 +1984,14 @@ def _group_bot_rights_for_request_chat() -> ChatAdministratorRights:
 
 
 def _reply_btn_add_channel() -> KeyboardButton:
-    # В request_chat нужны и user_*, и bot_*: права бота ⊆ прав пользователя; без user_* — USER_RIGHTS_MISSING.
+    # Не задаём user_administrator_rights: иначе Telegram разрешает выбрать чат только тем, у кого есть
+    # весь перечень прав (часто это только владелец). Любой администратор канала должен мочь поделиться чатом.
+    # Права бота при добавлении по-прежнему задаются через bot_administrator_rights.
     return KeyboardButton(
         text="Добавить канал",
         request_chat=KeyboardButtonRequestChat(
             request_id=REQ_CHAT_ADD_CHANNEL,
             chat_is_channel=True,
-            user_administrator_rights=_channel_bot_rights_for_request_chat(),
             bot_administrator_rights=_channel_bot_rights_for_request_chat(),
         ),
         **_pe_icon(_PE_SAVED_CHANNEL),
@@ -2003,7 +2004,6 @@ def _reply_btn_add_group() -> KeyboardButton:
         request_chat=KeyboardButtonRequestChat(
             request_id=REQ_CHAT_ADD_GROUP,
             chat_is_channel=False,
-            user_administrator_rights=_group_bot_rights_for_request_chat(),
             bot_administrator_rights=_group_bot_rights_for_request_chat(),
         ),
         **_pe_icon(_PE_SAVED_GROUP),
@@ -5283,18 +5283,7 @@ async def _notify_participants_finished(
         recipients.add(creator_id)
     for wid in winners:
         recipients.add(int(wid))
-    # Владельцы/админы приглашённых каналов: считаем приглашёнными те каналы,
-    # где создатель не владелец.
-    for cid in _publish_chat_ids_from_g(g):
-        try:
-            if creator_id and await _user_is_owner_of_chat(bot, int(cid), creator_id):
-                continue
-            _err, invitees = await _resolve_crosspost_invite_recipients(bot, int(cid))
-            for m in invitees:
-                if getattr(m, "user", None) and not m.user.is_bot:
-                    recipients.add(int(m.user.id))
-        except Exception as e:
-            log.debug("finish notify invitees %s: %s", cid, e)
+    # В ЛС уходит автору розыгрыша (created_by) и победителям — не владельцам каналов/групп.
     if not recipients:
         return
     if winners:
