@@ -45,12 +45,14 @@ from aiogram.fsm.state import State, StatesGroup, default_state
 from aiogram.types import (
     CallbackQuery,
     Chat,
+    ChatAdministratorRights,
     ChatMemberUpdated,
     ChatMemberOwner,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    KeyboardButtonRequestChat,
     LinkPreviewOptions,
     Message,
     MessageEntity,
@@ -210,7 +212,7 @@ def _start_welcome_photo_path() -> Path:
 REF_PREFIX = "ref_"
 JOIN_PREFIX = "join_"
 
-# request_id для chat_shared (редко; reply-кнопки без request_chat — см. menu_reply_text_add_*)
+# request_chat у reply-кнопок «добавить канал / группу»
 REQ_CHAT_ADD_CHANNEL = 1
 REQ_CHAT_ADD_GROUP = 2
 
@@ -1943,14 +1945,78 @@ async def _strip_reply_keyboard_in_chat(bot: Bot, chat_id: int) -> None:
         pass
 
 
+def _channel_request_chat_rights() -> ChatAdministratorRights:
+    """Права для request_chat (канал): user_* и bot_* должны совпадать (иначе USER_RIGHTS_MISSING).
+    Без can_promote_members — иначе системный выбор чата доступен по сути только владельцу канала.
+    Расширенное добавление бота по ссылке — по-прежнему в _DL_ADMIN_CH."""
+    return ChatAdministratorRights(
+        is_anonymous=False,
+        can_manage_chat=False,
+        can_delete_messages=True,
+        can_manage_video_chats=False,
+        can_restrict_members=False,
+        can_promote_members=False,
+        can_change_info=False,
+        can_invite_users=True,
+        can_post_stories=False,
+        can_edit_stories=False,
+        can_delete_stories=False,
+        can_post_messages=True,
+        can_edit_messages=True,
+        can_pin_messages=True,
+        can_manage_topics=False,
+        can_manage_direct_messages=False,
+    )
+
+
+def _group_request_chat_rights() -> ChatAdministratorRights:
+    """То же для «Добавить группу»: минимум флагов, чтобы админы без «добавлять админов» могли выбрать чат."""
+    return ChatAdministratorRights(
+        is_anonymous=False,
+        can_manage_chat=False,
+        can_delete_messages=True,
+        can_manage_video_chats=False,
+        can_restrict_members=False,
+        can_promote_members=False,
+        can_change_info=False,
+        can_invite_users=True,
+        can_post_stories=False,
+        can_edit_stories=False,
+        can_delete_stories=False,
+        can_pin_messages=True,
+        can_post_messages=False,
+        can_edit_messages=False,
+        can_manage_topics=False,
+        can_manage_direct_messages=False,
+    )
+
+
 def _reply_btn_add_channel() -> KeyboardButton:
-    """Обычная текстовая кнопка (без request_chat): иначе Telegram валит меню с USER_RIGHTS_MISSING
-    и привязывает клавиатуру к правам админа. Добавление в канал — по ссылке из ответа на нажатие."""
-    return KeyboardButton(text="Добавить канал", **_pe_icon(_PE_SAVED_CHANNEL))
+    r = _channel_request_chat_rights()
+    return KeyboardButton(
+        text="Добавить канал",
+        request_chat=KeyboardButtonRequestChat(
+            request_id=REQ_CHAT_ADD_CHANNEL,
+            chat_is_channel=True,
+            user_administrator_rights=r,
+            bot_administrator_rights=r,
+        ),
+        **_pe_icon(_PE_SAVED_CHANNEL),
+    )
 
 
 def _reply_btn_add_group() -> KeyboardButton:
-    return KeyboardButton(text="Добавить группу", **_pe_icon(_PE_SAVED_GROUP))
+    r = _group_request_chat_rights()
+    return KeyboardButton(
+        text="Добавить группу",
+        request_chat=KeyboardButtonRequestChat(
+            request_id=REQ_CHAT_ADD_GROUP,
+            chat_is_channel=False,
+            user_administrator_rights=r,
+            bot_administrator_rights=r,
+        ),
+        **_pe_icon(_PE_SAVED_GROUP),
+    )
 
 
 def _main_menu_reply_kb() -> ReplyKeyboardMarkup:
@@ -7322,23 +7388,9 @@ async def menu_btn_create(message: Message, state: FSMContext, bot: Bot) -> None
     await _remember_ui(state, sent.chat.id, sent.message_id)
 
 
-@router.message(StateFilter(default_state), F.chat.type == ChatType.PRIVATE, F.text == "Добавить канал")
-async def menu_reply_text_add_channel(message: Message, bot: Bot) -> None:
-    if not message.from_user:
-        return
-    await _send_add_channel_invite(bot, message.from_user.id)
-
-
-@router.message(StateFilter(default_state), F.chat.type == ChatType.PRIVATE, F.text == "Добавить группу")
-async def menu_reply_text_add_group(message: Message, bot: Bot) -> None:
-    if not message.from_user:
-        return
-    await _send_add_group_invite(bot, message.from_user.id)
-
-
 @router.message(StateFilter(default_state), F.chat.type == ChatType.PRIVATE, F.chat_shared)
 async def menu_reply_chat_shared(message: Message, bot: Bot, dispatcher: Dispatcher) -> None:
-    """Сохранение чата из chat_shared (если клиент когда-то прислал после выбора чата)."""
+    """Выбор чата через request_chat на reply-кнопках «добавить канал/группу»."""
     if not message.from_user or not message.chat_shared:
         return
     rid = message.chat_shared.request_id
