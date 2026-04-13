@@ -3575,8 +3575,9 @@ async def _edit_giveaway_public_message(
         use_entities = cts == "channel"
     except Exception:
         use_entities = False
-    # Для каналов редактируем текст через userbot, чтобы не терять premium emoji.
-    if use_entities:
+    # Для обычных розыгрышей в каналах редактируем текст через userbot.
+    # Для лотереи оставляем bot API + entities, чтобы корректно сохранять premium emoji из текста пользователя.
+    if use_entities and not _is_lottery(g):
         edited_by_userbot = await _edit_via_userbot_if_possible(bot, g, chat_id, message_id, card)
         if edited_by_userbot:
             try:
@@ -8391,6 +8392,8 @@ async def _send_via_userbot_if_possible(
     bot: Bot, g: dict[str, Any], publish_cid: int
 ) -> Optional[dict[str, int]]:
     # Только каналы: для групп оставляем обычный bot API.
+    if _is_lottery(g):
+        return None
     ub = await _get_userbot_client()
     if ub is None:
         return None
