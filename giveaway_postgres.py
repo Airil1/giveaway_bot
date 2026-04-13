@@ -2303,6 +2303,67 @@ def _restore_escaped_tg_emoji_html(src: str) -> str:
     return s
 
 
+def _strip_tg_emoji_tags_keep_glyph(src: str) -> str:
+    """Удаляет теги <tg-emoji>, оставляя только внутренний символ."""
+    s = _restore_escaped_tg_emoji_html(src or "")
+    return re.sub(
+        r'<tg-emoji\s+emoji-id="(\d+)"\s*>(.*?)</tg-emoji>',
+        lambda m: _html_to_plain_text_keep_linebreaks(m.group(2) or "")[:1] or "•",
+        s,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
+_CUSTOM_EMOJI_VALID_CACHE: dict[str, bool] = {}
+
+
+def _extract_tg_emoji_ids_from_html(src: str) -> list[str]:
+    s = _restore_escaped_tg_emoji_html(src or "")
+    ids = re.findall(r'<tg-emoji\s+emoji-id="(\d+)"\s*>', s, flags=re.IGNORECASE)
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in ids:
+        xid = str(x).strip()
+        if not xid or xid in seen:
+            continue
+        seen.add(xid)
+        out.append(xid)
+    return out
+
+
+async def _sanitize_tg_emoji_html_for_send(bot: Bot, src: str) -> str:
+    """Оставляет валидные tg-emoji, невалидные заменяет на обычный символ."""
+    s = _restore_escaped_tg_emoji_html(src or "")
+    ids = _extract_tg_emoji_ids_from_html(s)
+    unknown = [x for x in ids if x not in _CUSTOM_EMOJI_VALID_CACHE]
+    if unknown:
+        valid_now: set[str] = set()
+        try:
+            stickers = await bot.get_custom_emoji_stickers(custom_emoji_ids=unknown)
+            for st in (stickers or []):
+                sid = str(getattr(st, "custom_emoji_id", "") or "").strip()
+                if sid:
+                    valid_now.add(sid)
+        except Exception:
+            valid_now = set()
+        for x in unknown:
+            _CUSTOM_EMOJI_VALID_CACHE[x] = x in valid_now
+
+    def _repl(m: re.Match[str]) -> str:
+        eid = (m.group(1) or "").strip()
+        glyph = _html_to_plain_text_keep_linebreaks(m.group(2) or "")[:1] or "•"
+        if _CUSTOM_EMOJI_VALID_CACHE.get(eid, False):
+            return m.group(0)
+        return html.escape(glyph, quote=False)
+
+    return re.sub(
+        r'<tg-emoji\s+emoji-id="(\d+)"\s*>(.*?)</tg-emoji>',
+        _repl,
+        s,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
 def _message_html_preserve_custom_emoji(message: Message) -> str:
     """
     Prefer Telegram-provided html_text, but if custom emoji entities exist and
@@ -3404,8 +3465,8 @@ async def _giveaway_public_caption(bot: Bot, g: dict[str, Any]) -> str:
     if _is_lottery(g):
         is_finished = g.get("status") == "finished"
         tickets = max(1, min(100, int(g.get("lottery_ticket_count") or 1)))
-        title_html = _restore_escaped_tg_emoji_html((g.get("title") or "").strip())
-        desc = _restore_escaped_tg_emoji_html((g.get("description") or "").strip())
+        title_html = await _sanitize_tg_emoji_html_for_send(bot, (g.get("title") or "").strip())
+        desc = await _sanitize_tg_emoji_html_for_send(bot, (g.get("description") or "").strip())
         # `description` already stored as Telegram HTML (`message.html_text`),
         # so re-escaping here breaks custom premium emoji tags (<tg-emoji>).
         desc_html = desc if desc else ""
@@ -3438,9 +3499,11 @@ async def _giveaway_public_caption(bot: Bot, g: dict[str, Any]) -> str:
         else f"\n\n{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
         "чтобы попасть в розыгрыш"
     )
+    title_html = await _sanitize_tg_emoji_html_for_send(bot, (g.get("title") or "").strip())
+    desc_html = await _sanitize_tg_emoji_html_for_send(bot, g.get("description") or "")
     return (
-        f"{_tg_pe(_PE_GW_STEP1, '🎁')} {_restore_escaped_tg_emoji_html((g.get('title') or '').strip())}\n\n"
-        f"{_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
+        f"{_tg_pe(_PE_GW_STEP1, '🎁')} {title_html}\n\n"
+        f"{desc_html}\n\n"
         f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
         f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)"
         f"{cta_block}{winners_block}"
