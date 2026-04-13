@@ -3146,11 +3146,12 @@ async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, A
             link_preview_options=_LINK_PREVIEW_OFF,
         )
 
-    for label, cap, fn in (
-        ("full HTML", card, _send_html),
-        ("safe HTML", card_safe, _send_html),
-        ("plain text", card_plain, _send_plaintext),
-    ):
+    variants = (
+        (("safe HTML", card_safe, _send_html), ("full HTML", card, _send_html), ("plain text", card_plain, _send_plaintext))
+        if (_is_lottery(g) and "<tg-emoji" in card)
+        else (("full HTML", card, _send_html), ("safe HTML", card_safe, _send_html), ("plain text", card_plain, _send_plaintext))
+    )
+    for label, cap, fn in variants:
         try:
             return await fn(cap)
         except Exception as e:
@@ -3561,6 +3562,8 @@ async def _edit_giveaway_public_message(
 ) -> None:
     """Обновляет текст/подпись одного поста розыгрыша (канал/группа, основной или дубль)."""
     card = await _giveaway_public_caption(bot, g)
+    card_safe = await _giveaway_public_caption_safe(bot, g)
+    card_plain = _giveaway_public_caption_plain(g)
     kb = await _build_public_participant_kb(bot, g)
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
@@ -3678,6 +3681,81 @@ async def _edit_giveaway_public_message(
                 except Exception as e2:
                     log.debug("lottery fallback reply markup %s/%s: %s", chat_id, message_id, e2)
                 return
+        err_txt = str(e)
+        if ("Invalid custom emoji identifier" in err_txt) or ("can't parse entities" in err_txt):
+            try:
+                # Fallback to safe/plain card so winners block still updates.
+                if kind == "photo" and fid:
+                    try:
+                        await bot.edit_message_caption(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            caption=card_safe,
+                            reply_markup=kb,
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        await bot.edit_message_caption(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            caption=_truncate_telegram_text(card_plain, 1024),
+                            reply_markup=kb,
+                        )
+                elif kind == "animation" and fid:
+                    try:
+                        await bot.edit_message_caption(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            caption=card_safe,
+                            reply_markup=kb,
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        await bot.edit_message_caption(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            caption=_truncate_telegram_text(card_plain, 1024),
+                            reply_markup=kb,
+                        )
+                elif kind == "video" and fid:
+                    try:
+                        await bot.edit_message_caption(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            caption=card_safe,
+                            reply_markup=kb,
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        await bot.edit_message_caption(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            caption=_truncate_telegram_text(card_plain, 1024),
+                            reply_markup=kb,
+                        )
+                else:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text=card_safe,
+                            reply_markup=kb,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                            link_preview_options=_LINK_PREVIEW_OFF,
+                        )
+                    except Exception:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            text=_truncate_telegram_text(card_plain, 4096),
+                            reply_markup=kb,
+                            disable_web_page_preview=True,
+                            link_preview_options=_LINK_PREVIEW_OFF,
+                        )
+                return
+            except Exception as e2:
+                log.debug("edit giveaway safe fallback %s/%s: %s", chat_id, message_id, e2)
         log.debug("edit giveaway public msg %s/%s: %s", chat_id, message_id, e)
 
 
@@ -3928,12 +4006,20 @@ async def _send_giveaway_announcement_to_chat(
     # Для лотереи держим HTML в приоритете, чтобы сохранялись ссылки/форматирование блока победителей.
     # Для обычного розыгрыша оставляем прежний порядок с entities в каналах.
     if _is_lottery(g):
-        publish_steps = (
-            ("html_full", lambda: _send_html(card)),
-            ("html_safe", lambda: _send_html(card_safe)),
-            ("entities", lambda: _send_entities(card)),
-            ("plain", lambda: _send_plain(card_plain)),
-        )
+        if "<tg-emoji" in card:
+            publish_steps = (
+                ("html_safe", lambda: _send_html(card_safe)),
+                ("html_full", lambda: _send_html(card)),
+                ("entities", lambda: _send_entities(card)),
+                ("plain", lambda: _send_plain(card_plain)),
+            )
+        else:
+            publish_steps = (
+                ("html_full", lambda: _send_html(card)),
+                ("html_safe", lambda: _send_html(card_safe)),
+                ("entities", lambda: _send_entities(card)),
+                ("plain", lambda: _send_plain(card_plain)),
+            )
     elif chat_type_str in ("group", "supergroup"):
         publish_steps = (
             ("html_full", lambda: _send_html(card)),
