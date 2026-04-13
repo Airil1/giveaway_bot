@@ -2427,8 +2427,9 @@ def _giveaway_step1_title_html() -> str:
         f"{_tg_pe(_PE_GW_STEP1, '✨')} <b>Создание розыгрыша - шаг 1 из 6</b>\n\n"
         f"{_tg_pe(_PE_GW_PROMPT, '✏️')} Введите название розыгрыша -\n"
         "именно его увидят участники в заголовке.\n\n"
-        f"{_tg_pe(_PE_LOT_DOCWARN, '📎')} Чтобы использовать премиум-эмодзи,\n"
-        "добавьте нашего бота-помощника @AniGive в администраторы."
+        f"{_tg_pe(_PE_LOT_DOCWARN, '📎')} Для корректной работы бота,\n"
+        "пожалуйста, добавьте нашего бота-помощника  @AniGive\n"
+        "в список администраторов."
     )
 
 
@@ -5402,6 +5403,34 @@ async def _notify_participants_finished(
     bot: Bot, g: dict[str, Any], winners: list[int]
 ) -> None:
     gid = int(g.get("id") or 0)
+    title = _restore_escaped_tg_emoji_html((g.get("title") or f"#{gid}").strip() or f"#{gid}")
+    creator_id = int(g.get("created_by") or 0)
+
+    # 1) Создателю возвращаем прежнее детальное уведомление.
+    if creator_id > 0:
+        if winners:
+            body = await _format_winners_lines_html(bot, gid, winners)
+            creator_text = (
+                f"🏁 <b>{title}</b> — розыгрыш завершён.\n\n"
+                f"Победители:\n{body}"
+            )
+        else:
+            creator_text = (
+                f"🏁 <b>{title}</b> — розыгрыш завершён.\n\n"
+                "Победителей нет: никто не подошёл по условиям или не участвовал."
+            )
+        try:
+            await bot.send_message(
+                creator_id,
+                creator_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                link_preview_options=_LINK_PREVIEW_OFF,
+            )
+        except Exception as e:
+            log.debug("notify creator %s gid=%s: %s", creator_id, gid, e)
+
+    # 2) Победителям — краткое уведомление с ссылкой (как согласовано).
     if not winners:
         return
     text = await _winner_notification_html(bot, g)
