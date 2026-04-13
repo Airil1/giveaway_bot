@@ -3571,8 +3571,8 @@ async def _edit_giveaway_public_message(
         cts = getattr(t, "value", t) if t is not None else ""
         if not isinstance(cts, str):
             cts = str(cts)
-        # Как при публикации: в канале — entities; в группе/супергруппе — HTML с <tg-emoji> (вшитые premium).
-        use_entities = cts == "channel"
+        # Канал: для обычного розыгрыша entities, для лотереи HTML (чтобы не терять inline HTML-блоки).
+        use_entities = (cts == "channel") and (not _is_lottery(g))
     except Exception:
         use_entities = False
     # Для обычных розыгрышей в каналах редактируем текст через userbot.
@@ -3664,6 +3664,20 @@ async def _edit_giveaway_public_message(
                     link_preview_options=_LINK_PREVIEW_OFF,
                 )
     except TelegramBadRequest as e:
+        # Старые посты лотереи могли быть опубликованы userbot'ом; бот не может редактировать их текст.
+        # Пробуем userbot fallback, чтобы список победителей всё же обновлялся.
+        if _is_lottery(g):
+            edited_by_userbot = await _edit_via_userbot_if_possible(bot, g, chat_id, message_id, card)
+            if edited_by_userbot:
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        reply_markup=kb,
+                    )
+                except Exception as e2:
+                    log.debug("lottery fallback reply markup %s/%s: %s", chat_id, message_id, e2)
+                return
         log.debug("edit giveaway public msg %s/%s: %s", chat_id, message_id, e)
 
 
@@ -3911,9 +3925,16 @@ async def _send_giveaway_announcement_to_chat(
             **extra,
         )
 
-    # Каналы: сначала entities (custom emoji стабильно). Группы/супергруппы: сначала HTML с <tg-emoji>,
-    # иначе вшитые premium-иконки бота через entities часто отображаются как пустые/битые.
-    if chat_type_str in ("group", "supergroup"):
+    # Для лотереи держим HTML в приоритете, чтобы сохранялись ссылки/форматирование блока победителей.
+    # Для обычного розыгрыша оставляем прежний порядок с entities в каналах.
+    if _is_lottery(g):
+        publish_steps = (
+            ("html_full", lambda: _send_html(card)),
+            ("html_safe", lambda: _send_html(card_safe)),
+            ("entities", lambda: _send_entities(card)),
+            ("plain", lambda: _send_plain(card_plain)),
+        )
+    elif chat_type_str in ("group", "supergroup"):
         publish_steps = (
             ("html_full", lambda: _send_html(card)),
             ("html_safe", lambda: _send_html(card_safe)),
