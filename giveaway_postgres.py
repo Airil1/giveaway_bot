@@ -3407,26 +3407,27 @@ async def _giveaway_public_caption(bot: Bot, g: dict[str, Any]) -> str:
         # `description` already stored as Telegram HTML (`message.html_text`),
         # so re-escaping here breaks custom premium emoji tags (<tg-emoji>).
         desc_html = desc if desc else ""
+        winners_block = await _winners_block_html(bot, g) if is_finished else ""
         hint = (
             "<blockquote expandable>Нажми на номер билета ниже - если попадёшь в выигрышный квадрат, "
             "бот опубликует отдельный пост с победителем.</blockquote>"
         ) if not is_finished else ""
+        lottery_tail = winners_block if is_finished else hint
         body = (
             f"🎰 {title_html}\n\n"
             f"Количество билетов: <b>{tickets}</b>\n"
             f"Победителей: <b>{g['winners_count']}</b>\n\n"
-            f"{hint}"
+            f"{lottery_tail}"
         )
-        winners_block = await _winners_block_html(bot, g) if is_finished else ""
         if desc_html:
             return (
                 f"🎰 {title_html}\n\n"
                 f"{desc_html}\n\n"
                 f"Количество билетов: <b>{tickets}</b>\n"
                 f"Победителей: <b>{g['winners_count']}</b>\n\n"
-                f"{hint}{winners_block}"
+                f"{lottery_tail}"
             )
-        return body + winners_block
+        return body
     is_finished = g.get("status") == "finished"
     winners_block = await _winners_block_html(bot, g) if is_finished else ""
     cta_block = (
@@ -3455,26 +3456,27 @@ async def _giveaway_public_caption_safe(bot: Bot, g: dict[str, Any]) -> str:
         tickets = max(1, min(100, int(g.get("lottery_ticket_count") or 1)))
         title_esc = _user_stored_html_as_safe_plain_escape((g.get("title") or "").strip(), max_len=400)
         desc_esc = _user_stored_html_as_safe_plain_escape((g.get("description") or "").strip(), max_len=1200)
+        winners_block = await _winners_block_html(bot, g) if is_finished else ""
         hint = (
             "<blockquote expandable>Нажми на номер билета ниже - если попадёшь в выигрышный квадрат, "
             "бот опубликует отдельный пост с победителем.</blockquote>"
         ) if not is_finished else ""
+        lottery_tail = winners_block if is_finished else hint
         body = (
             f"🎰 {title_esc}\n\n"
             f"Количество билетов: <b>{tickets}</b>\n"
             f"Победителей: <b>{g['winners_count']}</b>\n\n"
-            f"{hint}"
+            f"{lottery_tail}"
         )
-        winners_block = await _winners_block_html(bot, g) if is_finished else ""
         if desc_esc:
             return (
                 f"🎰 {title_esc}\n\n"
                 f"{desc_esc}\n\n"
                 f"Количество билетов: <b>{tickets}</b>\n"
                 f"Победителей: <b>{g['winners_count']}</b>\n\n"
-                f"{hint}{winners_block}"
+                f"{lottery_tail}"
             )
-        return body + winners_block
+        return body
     title_esc = _user_stored_html_as_safe_plain_escape((g.get("title") or "").strip(), max_len=400)
     desc_esc = _user_stored_html_as_safe_plain_escape(g.get("description") or "", max_len=1200)
     is_finished = g.get("status") == "finished"
@@ -3511,24 +3513,25 @@ def _giveaway_public_caption_plain(g: dict[str, Any]) -> str:
         desc = _html_to_plain_text_keep_linebreaks(
             _restore_escaped_tg_emoji_html((g.get("description") or "").strip())
         ).strip()
+        winners_block = _winners_block_plain(g) if is_finished else ""
         hint = (
             "Нажми на номер билета ниже — если попадёшь в выигрышный квадрат, "
             "бот опубликует отдельный пост с победителем."
         ) if not is_finished else ""
-        winners_block = _winners_block_plain(g) if is_finished else ""
+        lottery_tail = winners_block if is_finished else hint
         if desc:
             return _truncate_telegram_text(
                 f"🎰 {title}\n\n{desc}\n\n"
                 f"Количество билетов: {tickets}\n"
                 f"Победителей: {g['winners_count']}\n\n"
-                f"{hint}{winners_block}",
+                f"{lottery_tail}",
                 1024,
             )
         return _truncate_telegram_text(
             f"🎰 {title}\n\n"
             f"Количество билетов: {tickets}\n"
             f"Победителей: {g['winners_count']}\n\n"
-            f"{hint}{winners_block}",
+            f"{lottery_tail}",
             1024,
         )
     title = _html_to_plain_text_keep_linebreaks(
@@ -5398,33 +5401,62 @@ async def _format_winners_lines_html(
 async def _notify_participants_finished(
     bot: Bot, g: dict[str, Any], winners: list[int]
 ) -> None:
-    gid = int(g["id"])
-    title = _restore_escaped_tg_emoji_html((g.get("title") or f"#{gid}").strip() or f"#{gid}")
-    creator_id = int(g.get("created_by") or 0)
-    recipients: set[int] = set()
-    if creator_id:
-        recipients.add(creator_id)
-    for wid in winners:
-        recipients.add(int(wid))
-    # В ЛС уходит автору розыгрыша (created_by) и победителям — не владельцам каналов/групп.
-    if not recipients:
+    gid = int(g.get("id") or 0)
+    if not winners:
         return
-    if winners:
-        body = await _format_winners_lines_html(bot, gid, winners)
-        text = (
-            f"🏁 <b>{title}</b> — розыгрыш завершён.\n\n"
-            f"Победители:\n{body}"
-        )
-    else:
-        text = (
-            f"🏁 <b>{title}</b> — розыгрыш завершён.\n\n"
-            "Победителей нет: никто не подошёл по условиям или не участвовал."
-        )
-    for uid in recipients:
+    text = await _winner_notification_html(bot, g)
+    for uid in {int(w) for w in winners if int(w) > 0}:
         try:
-            await bot.send_message(uid, text, parse_mode="HTML")
+            await bot.send_message(
+                uid,
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                link_preview_options=_LINK_PREVIEW_OFF,
+            )
         except Exception as e:
             log.debug("notify participant %s gid=%s: %s", uid, gid, e)
+
+
+async def _public_post_link(bot: Bot, g: dict[str, Any]) -> Optional[str]:
+    chat_id = g.get("post_chat_id")
+    message_id = g.get("post_message_id")
+    if chat_id is None or message_id is None:
+        return None
+    try:
+        cid = int(chat_id)
+        mid = int(message_id)
+    except (TypeError, ValueError):
+        return None
+    try:
+        ch = await bot.get_chat(cid)
+        uname = (getattr(ch, "username", None) or "").strip()
+        if uname:
+            return f"https://t.me/{uname}/{mid}"
+    except Exception:
+        pass
+    s = str(cid)
+    if s.startswith("-100") and len(s) > 4:
+        return f"https://t.me/c/{s[4:]}/{mid}"
+    return None
+
+
+async def _winner_notification_html(bot: Bot, g: dict[str, Any]) -> str:
+    is_lottery = _is_lottery(g)
+    head = "Вы выйграли в лотерее!" if is_lottery else "Вы выйграли в розыгрыше!"
+    link = await _public_post_link(bot, g)
+    title = "Канал/группа"
+    chat_id = g.get("post_chat_id")
+    if chat_id is not None:
+        try:
+            ch = await bot.get_chat(int(chat_id))
+            title = html.escape((getattr(ch, "title", None) or title), quote=False)
+        except Exception:
+            pass
+    if link:
+        safe_link = html.escape(link, quote=True)
+        return f'{head}\n<a href="{safe_link}">{title}</a>'
+    return f"{head}\n{title}"
 
 
 @router.callback_query(F.data == "adm_new")
@@ -7656,37 +7688,21 @@ async def cb_lottery_pick(query: CallbackQuery, bot: Bot) -> None:
     if not is_win:
         await query.answer("Не повезло, это не выигрышный билет.", show_alert=True)
         return
-    winner_name = html.escape(
-        (
-            ("@" + query.from_user.username)
-            if query.from_user.username
-            else (query.from_user.full_name or f"id {uid}")
-        ),
-        quote=False,
-    )
-    text = (
-        f"🎉 <b>Есть победитель в лотерее #{gid}!</b>\n\n"
-        f"Победитель: <a href=\"tg://user?id={uid}\">{winner_name}</a>\n"
-        f"Билет: <b>#{ticket_no}</b>"
-    )
     try:
         await _refresh_giveaway_public_posts(bot, g)
     except Exception as e:
         log.debug("lottery winner refresh %s: %s", gid, e)
-    creator_id = int(g.get("created_by") or 0)
-    for dm_uid in {uid, creator_id}:
-        if dm_uid <= 0:
-            continue
-        try:
-            await bot.send_message(
-                dm_uid,
-                text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                link_preview_options=_LINK_PREVIEW_OFF,
-            )
-        except Exception as e:
-            log.debug("lottery winner dm %s gid=%s: %s", dm_uid, gid, e)
+    text = await _winner_notification_html(bot, g)
+    try:
+        await bot.send_message(
+            uid,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            link_preview_options=_LINK_PREVIEW_OFF,
+        )
+    except Exception as e:
+        log.debug("lottery winner dm %s gid=%s: %s", uid, gid, e)
     await query.answer("Поздравляем! Вы выиграли 🎉", show_alert=True)
 
 
