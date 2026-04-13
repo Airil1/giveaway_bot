@@ -7721,6 +7721,32 @@ async def cb_lottery_pick(query: CallbackQuery, bot: Bot) -> None:
         await _refresh_giveaway_public_posts(bot, g)
     except Exception as e:
         log.debug("lottery winner refresh %s: %s", gid, e)
+    # Создателю лотереи — как раньше, подробное уведомление о новом победителе.
+    creator_id = int(g.get("created_by") or 0)
+    if creator_id > 0:
+        winner_name = html.escape(
+            (
+                ("@" + query.from_user.username)
+                if query.from_user.username
+                else (query.from_user.full_name or f"id {uid}")
+            ),
+            quote=False,
+        )
+        creator_text = (
+            f"🎉 <b>Есть победитель в лотерее #{gid}!</b>\n\n"
+            f"Победитель: <a href=\"tg://user?id={uid}\">{winner_name}</a>\n"
+            f"Билет: <b>#{ticket_no}</b>"
+        )
+        try:
+            await bot.send_message(
+                creator_id,
+                creator_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                link_preview_options=_LINK_PREVIEW_OFF,
+            )
+        except Exception as e:
+            log.debug("lottery creator notify %s gid=%s: %s", creator_id, gid, e)
     text = await _winner_notification_html(bot, g)
     try:
         await bot.send_message(
