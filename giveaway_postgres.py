@@ -2570,7 +2570,7 @@ def _giveaway_user_text(g: dict[str, Any]) -> str:
     desc_esc = _user_stored_html_as_safe_plain_escape(g.get("description") or "", max_len=1200)
     return (
         f"<b>{title_esc}</b>\n\n"
-        f"{desc_esc}\n\n"
+        f"Приз: {desc_esc}\n\n"
         f"{ch}"
         f"🏆 Победителей: {g['winners_count']}\n"
         f"⏳ Принимаем заявки до: {_format_ends_at_user(g['ends_at'])} (по Москве)"
@@ -2659,9 +2659,10 @@ async def _lottery_grid_kb(g: dict[str, Any]) -> InlineKeyboardMarkup:
         else:
             cb = "noop"
             style = "danger"
+        label = str(n) if custom_emoji_id else (f"{token} {n}".strip() if token else str(n))
         row.append(
             InlineKeyboardButton(
-                text=(f"{token} {n}".strip() if token else str(n)),
+                text=label,
                 callback_data=cb,
                 **{**_pe_icon(custom_emoji_id), **({"style": style} if style else {})},
             )
@@ -2674,7 +2675,9 @@ async def _lottery_grid_kb(g: dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _build_public_participant_kb(bot: Bot, g: dict[str, Any]) -> InlineKeyboardMarkup:
+async def _build_public_participant_kb(bot: Bot, g: dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
+    if g.get("status") == "finished":
+        return None
     if _is_lottery(g):
         return await _lottery_grid_kb(g)
     gid = int(g["id"])
@@ -2805,7 +2808,7 @@ async def _giveaway_dm_status_text_and_kb(
             tail = "✅ Условия выполнены."
         text = (
             f"<b>{title}</b>\n\n"
-            f"{desc}\n\n"
+            f"Приз: {desc}\n\n"
             f"{subscribe_block}"
             f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
             f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} Принимаем заявки до: {_format_ends_at_user(g['ends_at'])} (по Москве)\n\n"
@@ -2828,7 +2831,7 @@ async def _giveaway_dm_status_text_and_kb(
             )
         text = (
             f"<b>{title}</b>\n\n"
-            f"{desc}\n\n"
+            f"Приз: {desc}\n\n"
             f"{subscribe_block}"
             f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
             f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} Принимаем заявки до: {_format_ends_at_user(g['ends_at'])} (по Москве)\n"
@@ -3097,8 +3100,8 @@ def _draft_lottery_kb(gid: int) -> InlineKeyboardMarkup:
 
 async def _send_draft_giveaway_ui_message(bot: Bot, chat_id: int, g: dict[str, Any]) -> Message:
     """Сообщение как в канале (подпись/медиа), но с клавиатурой управления черновиком."""
-    card = _giveaway_public_caption(g)
-    card_safe = _giveaway_public_caption_safe(g)
+    card = await _giveaway_public_caption(bot, g)
+    card_safe = await _giveaway_public_caption_safe(bot, g)
     card_plain = _giveaway_public_caption_plain(g)
     kb = _draft_lottery_kb(int(g["id"])) if _is_lottery(g) else _draft_giveaway_kb(int(g["id"]))
     kind = (g.get("post_media_kind") or "").strip()
@@ -3363,7 +3366,39 @@ def _draft_extra_kb(g: dict[str, Any]) -> InlineKeyboardMarkup:
 _DRAFT_EXTRA_SCREEN_TITLE = f"{_tg_pe(_PE_DRAFT_EXTRA, '⚙️')} <b>Доп.функции</b>\n\n"
 
 
-def _giveaway_public_caption(g: dict[str, Any]) -> str:
+async def _winners_block_html(bot: Bot, g: dict[str, Any]) -> str:
+    raw = (g.get("last_winners_json") or "").strip()
+    if not raw:
+        return ""
+    try:
+        winners = [int(x) for x in json.loads(raw)]
+    except Exception:
+        winners = []
+    if not winners:
+        return ""
+    title = "Победитель:" if len(winners) == 1 else "Победители:"
+    lines = await _format_winners_lines_html(bot, int(g.get("id") or 0), winners)
+    if not lines:
+        return ""
+    return f"\n\n{title}\n{lines}"
+
+
+def _winners_block_plain(g: dict[str, Any]) -> str:
+    raw = (g.get("last_winners_json") or "").strip()
+    if not raw:
+        return ""
+    try:
+        winners = [int(x) for x in json.loads(raw)]
+    except Exception:
+        winners = []
+    if not winners:
+        return ""
+    title = "Победитель:" if len(winners) == 1 else "Победители:"
+    lines = [f"{i}. id {wid}" for i, wid in enumerate(winners, 1)]
+    return f"\n\n{title}\n" + "\n".join(lines)
+
+
+async def _giveaway_public_caption(bot: Bot, g: dict[str, Any]) -> str:
     if _is_lottery(g):
         tickets = max(1, min(100, int(g.get("lottery_ticket_count") or 1)))
         title_html = _restore_escaped_tg_emoji_html((g.get("title") or "").strip())
@@ -3381,26 +3416,28 @@ def _giveaway_public_caption(g: dict[str, Any]) -> str:
             f"Победителей: <b>{g['winners_count']}</b>\n\n"
             f"{hint}"
         )
+        winners_block = await _winners_block_html(bot, g) if g.get("status") == "finished" else ""
         if desc_html:
             return (
                 f"🎰 {title_html}\n\n"
-                f"{desc_html}\n\n"
+                f"Приз: {desc_html}\n\n"
                 f"Количество билетов: <b>{tickets}</b>\n"
                 f"Победителей: <b>{g['winners_count']}</b>\n\n"
-                f"{hint}"
+                f"{hint}{winners_block}"
             )
-        return body
+        return body + winners_block
+    winners_block = await _winners_block_html(bot, g) if g.get("status") == "finished" else ""
     return (
         f"{_tg_pe(_PE_GW_STEP1, '🎁')} {_restore_escaped_tg_emoji_html((g.get('title') or '').strip())}\n\n"
-        f"{_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
+        f"Приз: {_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
         f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
         f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
         f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
-        "чтобы попасть в розыгрыш"
+        f"чтобы попасть в розыгрыш{winners_block}"
     )
 
 
-def _giveaway_public_caption_safe(g: dict[str, Any]) -> str:
+async def _giveaway_public_caption_safe(bot: Bot, g: dict[str, Any]) -> str:
     """Тот же каркас, что у `_giveaway_public_caption`, но название/описание без чужих <tg-emoji>.
 
     Исходящие сообщения бота с custom emoji из набора *другого* аккаунта часто дают TelegramBadRequest;
@@ -3420,24 +3457,26 @@ def _giveaway_public_caption_safe(g: dict[str, Any]) -> str:
             f"Победителей: <b>{g['winners_count']}</b>\n\n"
             f"{hint}"
         )
+        winners_block = await _winners_block_html(bot, g) if g.get("status") == "finished" else ""
         if desc_esc:
             return (
                 f"🎰 {title_esc}\n\n"
-                f"{desc_esc}\n\n"
+                f"Приз: {desc_esc}\n\n"
                 f"Количество билетов: <b>{tickets}</b>\n"
                 f"Победителей: <b>{g['winners_count']}</b>\n\n"
-                f"{hint}"
+                f"{hint}{winners_block}"
             )
-        return body
+        return body + winners_block
     title_esc = _user_stored_html_as_safe_plain_escape((g.get("title") or "").strip(), max_len=400)
     desc_esc = _user_stored_html_as_safe_plain_escape(g.get("description") or "", max_len=1200)
+    winners_block = await _winners_block_html(bot, g) if g.get("status") == "finished" else ""
     return (
         f"{_tg_pe(_PE_GW_STEP1, '🎁')} {title_esc}\n\n"
-        f"{desc_esc}\n\n"
+        f"Приз: {desc_esc}\n\n"
         f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
         f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
         f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
-        "чтобы попасть в розыгрыш"
+        f"чтобы попасть в розыгрыш{winners_block}"
     )
 
 
@@ -3461,19 +3500,20 @@ def _giveaway_public_caption_plain(g: dict[str, Any]) -> str:
             "Нажми на номер билета ниже — если попадёшь в выигрышный квадрат, "
             "бот опубликует отдельный пост с победителем."
         )
+        winners_block = _winners_block_plain(g) if g.get("status") == "finished" else ""
         if desc:
             return _truncate_telegram_text(
-                f"🎰 {title}\n\n{desc}\n\n"
+                f"🎰 {title}\n\nПриз: {desc}\n\n"
                 f"Количество билетов: {tickets}\n"
                 f"Победителей: {g['winners_count']}\n\n"
-                f"{hint}",
+                f"{hint}{winners_block}",
                 1024,
             )
         return _truncate_telegram_text(
             f"🎰 {title}\n\n"
             f"Количество билетов: {tickets}\n"
             f"Победителей: {g['winners_count']}\n\n"
-            f"{hint}",
+            f"{hint}{winners_block}",
             1024,
         )
     title = _html_to_plain_text_keep_linebreaks(
@@ -3482,11 +3522,12 @@ def _giveaway_public_caption_plain(g: dict[str, Any]) -> str:
     desc = _html_to_plain_text_keep_linebreaks(
         _restore_escaped_tg_emoji_html((g.get("description") or "").strip())
     ).strip()
+    winners_block = _winners_block_plain(g) if g.get("status") == "finished" else ""
     body = (
-        f"🎁 {title}\n\n{desc}\n\n"
+        f"🎁 {title}\n\nПриз: {desc}\n\n"
         f"Победителей: {g['winners_count']}\n"
         f"До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
-        "Жми «Участвовать» под этим постом и выполни все условия, чтобы попасть в розыгрыш"
+        f"Жми «Участвовать» под этим постом и выполни все условия, чтобы попасть в розыгрыш{winners_block}"
     )
     return _truncate_telegram_text(body, 4096)
 
@@ -3495,7 +3536,7 @@ async def _edit_giveaway_public_message(
     bot: Bot, chat_id: int, message_id: int, g: dict[str, Any]
 ) -> None:
     """Обновляет текст/подпись одного поста розыгрыша (канал/группа, основной или дубль)."""
-    card = _giveaway_public_caption(g)
+    card = await _giveaway_public_caption(bot, g)
     kb = await _build_public_participant_kb(bot, g)
     kind = (g.get("post_media_kind") or "").strip()
     fid = g.get("post_media_file_id")
@@ -3663,8 +3704,8 @@ async def _send_giveaway_announcement_to_chat(
         m.chat.id = int(sent_userbot["chat_id"])
         m.message_id = int(sent_userbot["message_id"])
         return m  # type: ignore[return-value]
-    card = _giveaway_public_caption(g)
-    card_safe = _giveaway_public_caption_safe(g)
+    card = await _giveaway_public_caption(bot, g)
+    card_safe = await _giveaway_public_caption_safe(bot, g)
     card_plain = _giveaway_public_caption_plain(g)
     kb_main = await _build_public_participant_kb(bot, g)
     kind = (g.get("post_media_kind") or "").strip()
@@ -5244,7 +5285,7 @@ async def _format_winners_lines_html(
     giveaway_id: int,
     winner_ids: list[int],
 ) -> str:
-    """Список победителей HTML: кликабельное имя (ссылка tg://user), текст — @username или имя."""
+    """Список победителей HTML: кликабельное имя (ссылка tg://user), без @username в подписи."""
     lines: list[str] = []
     async with _pg_conn() as db:
         for i, wid in enumerate(winner_ids, 1):
@@ -5255,27 +5296,21 @@ async def _format_winners_lines_html(
             )
             row = await cur.fetchone()
             if row:
-                un = (row["username"] or "").strip()
                 fn = (row["first_name"] or "").strip()
-                if un:
-                    label = f"@{un.lstrip('@')}"
-                elif fn:
+                if fn:
                     label = fn
             if not label:
                 try:
                     ch = await bot.get_chat(wid)
-                    if ch.username:
-                        label = f"@{ch.username}"
-                    else:
-                        label = (
-                            " ".join(
-                                x for x in (ch.first_name or "", ch.last_name or "") if x
-                            ).strip()
-                        )
+                    label = (
+                        " ".join(
+                            x for x in (ch.first_name or "", ch.last_name or "") if x
+                        ).strip()
+                    )
                 except Exception:
                     pass
             if not label:
-                label = f"id {wid}"
+                label = f"Пользователь {wid}"
             safe = html.escape(label, quote=False)
             lines.append(f'{i}. <a href="tg://user?id={wid}">{safe}</a>')
     return "\n".join(lines)
@@ -7464,6 +7499,7 @@ async def cb_lottery_pick(query: CallbackQuery, bot: Bot) -> None:
         return
     uid = int(query.from_user.id)
     is_win = 0
+    winners_now: list[int] = []
     async with _pg_conn() as db:
         g = await get_giveaway(db, gid)
         if not g or g.get("status") != "active" or not _is_lottery(g):
@@ -7511,10 +7547,20 @@ async def cb_lottery_pick(query: CallbackQuery, bot: Bot) -> None:
             "INSERT INTO lottery_picks (giveaway_id, user_id, ticket_no, is_winner, won_at) VALUES (?, ?, ?, ?, ?)",
             (gid, uid, ticket_no, is_win, (_utc_now().isoformat() if is_win else None)),
         )
+        cur_now = await db.execute(
+            "SELECT user_id FROM lottery_picks WHERE giveaway_id = ? AND is_winner = 1 ORDER BY won_at, id",
+            (gid,),
+        )
+        winners_now = [int(r["user_id"]) for r in await cur_now.fetchall()]
         if is_win and (winners_so_far + 1) >= winners_needed:
             await db.execute(
-                "UPDATE giveaways SET status = 'finished' WHERE id = ? AND giveaway_type = 'lottery'",
-                (gid,),
+                "UPDATE giveaways SET status = 'finished', last_winners_json = ? WHERE id = ? AND giveaway_type = 'lottery'",
+                (json.dumps(winners_now), gid),
+            )
+        elif is_win:
+            await db.execute(
+                "UPDATE giveaways SET last_winners_json = ? WHERE id = ? AND giveaway_type = 'lottery'",
+                (json.dumps(winners_now), gid),
             )
         await db.commit()
     try:
@@ -7544,12 +7590,10 @@ async def cb_lottery_pick(query: CallbackQuery, bot: Bot) -> None:
         f"Победитель: <a href=\"tg://user?id={uid}\">{winner_name}</a>\n"
         f"Билет: <b>#{ticket_no}</b>"
     )
-    target = int(g.get("post_chat_id") or query.message.chat.id)
     try:
-        await bot.send_message(target, text, parse_mode="HTML")
-        await _broadcast_results_to_mirrors(bot, g, text)
+        await _refresh_giveaway_public_posts(bot, g)
     except Exception as e:
-        log.debug("lottery winner publish %s: %s", gid, e)
+        log.debug("lottery winner refresh %s: %s", gid, e)
     creator_id = int(g.get("created_by") or 0)
     for dm_uid in {uid, creator_id}:
         if dm_uid <= 0:
@@ -7602,28 +7646,22 @@ async def cb_draw(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         )
         return
 
-    body = await _format_winners_lines_html(bot, gid, winners)
-    gt = _giveaway_title_html(g, gid)
-    publ = f"🎉 <b>{gt} — итоги</b>\n\nПоздравляем победителей:\n{body}"
-
-    pub_chat = g.get("post_chat_id")
-    target = int(pub_chat) if pub_chat else query.message.chat.id
-    sent = await bot.send_message(target, publ)
-    mirror_res = await _broadcast_results_to_mirrors(bot, g, publ)
     wjson = json.dumps(winners)
     async with _pg_conn() as db:
         await db.execute(
-            "UPDATE giveaways SET results_chat_id = ?, results_message_id = ?, status = 'finished', last_winners_json = ?, mirror_results_json = ? WHERE id = ?",
-            (sent.chat.id, sent.message_id, wjson, json.dumps(mirror_res, ensure_ascii=False), gid),
+            "UPDATE giveaways SET status = 'finished', last_winners_json = ? WHERE id = ?",
+            (wjson, gid),
         )
         await db.commit()
         g_fin = await get_giveaway(db, gid)
+    if g_fin is not None:
+        await _refresh_giveaway_public_posts(bot, g_fin)
     await _notify_participants_finished(bot, g, winners)
     await _render_callback_screen(
         query,
         state,
         bot,
-        "✅ Победители выбраны.\nИтог ушёл туда, где висел пост, и в связанные каналах, если настраивали.",
+        "✅ Победители выбраны.\nСписок добавлен внизу основного поста розыгрыша.",
         _admin_kb_giveaway(g_fin if g_fin is not None else g),
     )
 
@@ -7666,28 +7704,23 @@ async def _reroll_apply_and_publish(
     gid: int,
     winners: list[int],
 ) -> None:
-    body = await _format_winners_lines_html(bot, gid, winners)
-    gt = _giveaway_title_html(g, gid)
-    publ = f"🔁 <b>{gt} — новые победители</b>\n\nВот обновлённый список:\n{body}"
-    pub_chat = g.get("post_chat_id")
-    target = int(pub_chat) if pub_chat else query.message.chat.id
-    sent = await bot.send_message(target, publ)
-    mirror_res = await _broadcast_results_to_mirrors(bot, g, publ)
     wjson = json.dumps(winners)
     async with _pg_conn() as db:
         await db.execute(
-            "UPDATE giveaways SET results_chat_id = ?, results_message_id = ?, last_winners_json = ?, mirror_results_json = ? WHERE id = ?",
-            (sent.chat.id, sent.message_id, wjson, json.dumps(mirror_res, ensure_ascii=False), gid),
+            "UPDATE giveaways SET last_winners_json = ? WHERE id = ?",
+            (wjson, gid),
         )
         await db.commit()
         g_after = await get_giveaway(db, gid)
+    if g_after is not None:
+        await _refresh_giveaway_public_posts(bot, g_after)
     await _notify_participants_finished(bot, g, winners)
     g_kb = g_after if g_after is not None else g
     await _render_callback_screen(
         query,
         state,
         bot,
-        "✅ Перевыбрали.\nНовый итог там же, где пост, и в связанных каналах, если настраивали.",
+        "✅ Перевыбрали.\nСписок победителей обновлён внизу поста.",
         _admin_kb_giveaway(g_kb),
     )
 
@@ -8217,7 +8250,7 @@ async def _send_via_userbot_if_possible(
         return None
     if getattr(ch, "type", "") != "channel":
         return None
-    card = _giveaway_public_caption(g)
+    card = await _giveaway_public_caption(bot, g)
     kind = (g.get("post_media_kind") or "").strip()
     fid = (g.get("post_media_file_id") or "").strip()
     join_url: Optional[str] = None
@@ -8340,24 +8373,15 @@ async def auto_finish_loop(bot: Bot) -> None:
                     winners = await _weighted_draw(bot, db_draw, g)
 
                 if not winners:
-                    gt = _giveaway_title_html(g, gid)
-                    no_win_text = (
-                        f"🏁 <b>{gt} — конкурс закончился</b>\n\n"
-                        "Победителей нет — либо никто не подошёл по правилам, либо никто не участвовал."
-                    )
-                    mirror_res: list[dict[str, Any]] = []
                     async with _pg_conn() as db_up:
-                        if post_cid:
-                            try:
-                                await bot.send_message(int(post_cid), no_win_text)
-                            except Exception as e:
-                                log.exception("auto_finish no winners publish %s: %s", gid, e)
-                        mirror_res = await _broadcast_results_to_mirrors(bot, g, no_win_text)
                         await db_up.execute(
-                            "UPDATE giveaways SET status = 'finished', last_winners_json = '[]', mirror_results_json = ? WHERE id = ?",
-                            (json.dumps(mirror_res, ensure_ascii=False), gid),
+                            "UPDATE giveaways SET status = 'finished', last_winners_json = '[]' WHERE id = ?",
+                            (gid,),
                         )
                         await db_up.commit()
+                        g_fin = await get_giveaway(db_up, gid)
+                    if g_fin is not None:
+                        await _refresh_giveaway_public_posts(bot, g_fin)
                     await _notify_participants_finished(bot, g, [])
                     continue
 
@@ -8373,22 +8397,20 @@ async def auto_finish_loop(bot: Bot) -> None:
                     await _notify_participants_finished(bot, g, winners)
                     continue
 
-                body = await _format_winners_lines_html(bot, gid, winners)
-                gt = _giveaway_title_html(g, gid)
-                text = f"🎉 <b>{gt} — итоги</b>\n\nПоздравляем победителей:\n{body}"
                 try:
-                    sent = await bot.send_message(int(post_cid), text)
-                    mirror_res = await _broadcast_results_to_mirrors(bot, g, text)
                     wjson = json.dumps(winners)
                     async with _pg_conn() as db3:
                         await db3.execute(
-                            "UPDATE giveaways SET results_chat_id = ?, results_message_id = ?, status = 'finished', last_winners_json = ?, mirror_results_json = ? WHERE id = ?",
-                            (sent.chat.id, sent.message_id, wjson, json.dumps(mirror_res, ensure_ascii=False), gid),
+                            "UPDATE giveaways SET status = 'finished', last_winners_json = ? WHERE id = ?",
+                            (wjson, gid),
                         )
                         await db3.commit()
+                        g_fin = await get_giveaway(db3, gid)
+                    if g_fin is not None:
+                        await _refresh_giveaway_public_posts(bot, g_fin)
                     await _notify_participants_finished(bot, g, winners)
                 except Exception as e:
-                    log.exception("auto_finish publish winners %s: %s", gid, e)
+                    log.exception("auto_finish update winners %s: %s", gid, e)
         except asyncio.CancelledError:
             raise
         except Exception:
