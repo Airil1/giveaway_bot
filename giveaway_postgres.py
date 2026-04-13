@@ -4667,18 +4667,29 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
                     )
                 text, kb = await _giveaway_dm_status_text_and_kb(bot, db, g, uid)
                 text_safe = await _sanitize_tg_emoji_html_for_send(bot, text)
-                # В этом entrypoint критичнее не уронить join-flow:
-                # отправляем без parse_mode, но сохраняем premium emoji через entities.
-                dm_text, dm_entities = _html_to_text_and_custom_entities(text_safe)
-                sent = await bot.send_message(
-                    uid,
-                    dm_text,
-                    reply_markup=kb,
-                    parse_mode=None,
-                    entities=dm_entities or None,
-                    disable_web_page_preview=True,
-                    link_preview_options=_LINK_PREVIEW_OFF,
-                )
+                # Сначала пробуем полноценный HTML (лучше сохраняет и формат, и premium emoji).
+                # При любой ошибке уходим в безопасный fallback, чтобы не ломать join-flow.
+                try:
+                    sent = await bot.send_message(
+                        uid,
+                        text_safe,
+                        reply_markup=kb,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                        link_preview_options=_LINK_PREVIEW_OFF,
+                    )
+                except Exception as e:
+                    log.warning("cmd_start dm html failed, fallback to entities/plain: %s", e)
+                    dm_text, dm_entities = _html_to_text_and_custom_entities(text_safe)
+                    sent = await bot.send_message(
+                        uid,
+                        dm_text,
+                        reply_markup=kb,
+                        parse_mode=None,
+                        entities=dm_entities or None,
+                        disable_web_page_preview=True,
+                        link_preview_options=_LINK_PREVIEW_OFF,
+                    )
                 await _remember_ui(state, sent.chat.id, sent.message_id)
                 return
         sent = await bot.send_message(
