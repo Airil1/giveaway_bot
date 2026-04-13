@@ -4666,7 +4666,8 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
                         referrer_id=deep_referrer_id,
                     )
                 text, kb = await _giveaway_dm_status_text_and_kb(bot, db, g, uid)
-                sent = await bot.send_message(uid, text, reply_markup=kb, parse_mode="HTML")
+                text_safe = await _sanitize_tg_emoji_html_for_send(bot, text)
+                sent = await bot.send_message(uid, text_safe, reply_markup=kb, parse_mode="HTML")
                 await _remember_ui(state, sent.chat.id, sent.message_id)
                 return
         sent = await bot.send_message(
