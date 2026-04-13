@@ -2676,7 +2676,7 @@ async def _lottery_grid_kb(g: dict[str, Any]) -> InlineKeyboardMarkup:
 
 
 async def _build_public_participant_kb(bot: Bot, g: dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
-    if g.get("status") == "finished":
+    if g.get("status") == "finished" and not _is_lottery(g):
         return None
     if _is_lottery(g):
         return await _lottery_grid_kb(g)
@@ -3400,6 +3400,7 @@ def _winners_block_plain(g: dict[str, Any]) -> str:
 
 async def _giveaway_public_caption(bot: Bot, g: dict[str, Any]) -> str:
     if _is_lottery(g):
+        is_finished = g.get("status") == "finished"
         tickets = max(1, min(100, int(g.get("lottery_ticket_count") or 1)))
         title_html = _restore_escaped_tg_emoji_html((g.get("title") or "").strip())
         desc = _restore_escaped_tg_emoji_html((g.get("description") or "").strip())
@@ -3409,14 +3410,14 @@ async def _giveaway_public_caption(bot: Bot, g: dict[str, Any]) -> str:
         hint = (
             "<blockquote expandable>Нажми на номер билета ниже - если попадёшь в выигрышный квадрат, "
             "бот опубликует отдельный пост с победителем.</blockquote>"
-        )
+        ) if not is_finished else ""
         body = (
             f"🎰 {title_html}\n\n"
             f"Количество билетов: <b>{tickets}</b>\n"
             f"Победителей: <b>{g['winners_count']}</b>\n\n"
             f"{hint}"
         )
-        winners_block = await _winners_block_html(bot, g) if g.get("status") == "finished" else ""
+        winners_block = await _winners_block_html(bot, g) if is_finished else ""
         if desc_html:
             return (
                 f"🎰 {title_html}\n\n"
@@ -3426,14 +3427,20 @@ async def _giveaway_public_caption(bot: Bot, g: dict[str, Any]) -> str:
                 f"{hint}{winners_block}"
             )
         return body + winners_block
-    winners_block = await _winners_block_html(bot, g) if g.get("status") == "finished" else ""
+    is_finished = g.get("status") == "finished"
+    winners_block = await _winners_block_html(bot, g) if is_finished else ""
+    cta_block = (
+        ""
+        if is_finished
+        else f"\n\n{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
+        "чтобы попасть в розыгрыш"
+    )
     return (
         f"{_tg_pe(_PE_GW_STEP1, '🎁')} {_restore_escaped_tg_emoji_html((g.get('title') or '').strip())}\n\n"
         f"{_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
         f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
-        f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
-        f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
-        f"чтобы попасть в розыгрыш{winners_block}"
+        f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)"
+        f"{cta_block}{winners_block}"
     )
 
 
@@ -3444,20 +3451,21 @@ async def _giveaway_public_caption_safe(bot: Bot, g: dict[str, Any]) -> str:
     тогда показываем текст призов без premium-иконок (как в `_user_stored_html_as_safe_plain_escape`).
     """
     if _is_lottery(g):
+        is_finished = g.get("status") == "finished"
         tickets = max(1, min(100, int(g.get("lottery_ticket_count") or 1)))
         title_esc = _user_stored_html_as_safe_plain_escape((g.get("title") or "").strip(), max_len=400)
         desc_esc = _user_stored_html_as_safe_plain_escape((g.get("description") or "").strip(), max_len=1200)
         hint = (
             "<blockquote expandable>Нажми на номер билета ниже - если попадёшь в выигрышный квадрат, "
             "бот опубликует отдельный пост с победителем.</blockquote>"
-        )
+        ) if not is_finished else ""
         body = (
             f"🎰 {title_esc}\n\n"
             f"Количество билетов: <b>{tickets}</b>\n"
             f"Победителей: <b>{g['winners_count']}</b>\n\n"
             f"{hint}"
         )
-        winners_block = await _winners_block_html(bot, g) if g.get("status") == "finished" else ""
+        winners_block = await _winners_block_html(bot, g) if is_finished else ""
         if desc_esc:
             return (
                 f"🎰 {title_esc}\n\n"
@@ -3469,14 +3477,20 @@ async def _giveaway_public_caption_safe(bot: Bot, g: dict[str, Any]) -> str:
         return body + winners_block
     title_esc = _user_stored_html_as_safe_plain_escape((g.get("title") or "").strip(), max_len=400)
     desc_esc = _user_stored_html_as_safe_plain_escape(g.get("description") or "", max_len=1200)
-    winners_block = await _winners_block_html(bot, g) if g.get("status") == "finished" else ""
+    is_finished = g.get("status") == "finished"
+    winners_block = await _winners_block_html(bot, g) if is_finished else ""
+    cta_block = (
+        ""
+        if is_finished
+        else f"\n\n{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
+        "чтобы попасть в розыгрыш"
+    )
     return (
         f"{_tg_pe(_PE_GW_STEP1, '🎁')} {title_esc}\n\n"
         f"{desc_esc}\n\n"
         f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
-        f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
-        f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
-        f"чтобы попасть в розыгрыш{winners_block}"
+        f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)"
+        f"{cta_block}{winners_block}"
     )
 
 
@@ -3489,6 +3503,7 @@ def _truncate_telegram_text(s: str, max_len: int) -> str:
 def _giveaway_public_caption_plain(g: dict[str, Any]) -> str:
     """Текст черновика без HTML-тегов — если даже safe HTML не принимает API (редкие случаи)."""
     if _is_lottery(g):
+        is_finished = g.get("status") == "finished"
         tickets = max(1, min(100, int(g.get("lottery_ticket_count") or 1)))
         title = _html_to_plain_text_keep_linebreaks(
             _restore_escaped_tg_emoji_html((g.get("title") or "").strip())
@@ -3499,8 +3514,8 @@ def _giveaway_public_caption_plain(g: dict[str, Any]) -> str:
         hint = (
             "Нажми на номер билета ниже — если попадёшь в выигрышный квадрат, "
             "бот опубликует отдельный пост с победителем."
-        )
-        winners_block = _winners_block_plain(g) if g.get("status") == "finished" else ""
+        ) if not is_finished else ""
+        winners_block = _winners_block_plain(g) if is_finished else ""
         if desc:
             return _truncate_telegram_text(
                 f"🎰 {title}\n\n{desc}\n\n"
@@ -3523,11 +3538,16 @@ def _giveaway_public_caption_plain(g: dict[str, Any]) -> str:
         _restore_escaped_tg_emoji_html((g.get("description") or "").strip())
     ).strip()
     winners_block = _winners_block_plain(g) if g.get("status") == "finished" else ""
+    cta_block = (
+        ""
+        if g.get("status") == "finished"
+        else "\n\nЖми «Участвовать» под этим постом и выполни все условия, чтобы попасть в розыгрыш"
+    )
     body = (
         f"🎁 {title}\n\n{desc}\n\n"
         f"Победителей: {g['winners_count']}\n"
-        f"До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
-        f"Жми «Участвовать» под этим постом и выполни все условия, чтобы попасть в розыгрыш{winners_block}"
+        f"До: {_format_ends_at_user(g['ends_at'])} (МСК)"
+        f"{cta_block}{winners_block}"
     )
     return _truncate_telegram_text(body, 4096)
 
