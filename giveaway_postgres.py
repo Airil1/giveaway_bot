@@ -4667,18 +4667,15 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
                     )
                 text, kb = await _giveaway_dm_status_text_and_kb(bot, db, g, uid)
                 text_safe = await _sanitize_tg_emoji_html_for_send(bot, text)
-                try:
-                    sent = await bot.send_message(uid, text_safe, reply_markup=kb, parse_mode="HTML")
-                except TelegramBadRequest as e:
-                    # Никогда не роняем deep-link join из-за битого custom emoji в HTML.
-                    log.warning("cmd_start dm html failed, fallback to plain: %s", e)
-                    sent = await bot.send_message(
-                        uid,
-                        _html_to_plain_text_keep_linebreaks(text_safe),
-                        reply_markup=kb,
-                        disable_web_page_preview=True,
-                        link_preview_options=_LINK_PREVIEW_OFF,
-                    )
+                # В этом entrypoint критичнее не уронить join-flow: отправляем как plain без parse_mode.
+                sent = await bot.send_message(
+                    uid,
+                    _html_to_plain_text_keep_linebreaks(text_safe),
+                    reply_markup=kb,
+                    parse_mode=None,
+                    disable_web_page_preview=True,
+                    link_preview_options=_LINK_PREVIEW_OFF,
+                )
                 await _remember_ui(state, sent.chat.id, sent.message_id)
                 return
         sent = await bot.send_message(
