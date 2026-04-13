@@ -2570,7 +2570,7 @@ def _giveaway_user_text(g: dict[str, Any]) -> str:
     desc_esc = _user_stored_html_as_safe_plain_escape(g.get("description") or "", max_len=1200)
     return (
         f"<b>{title_esc}</b>\n\n"
-        f"Приз: {desc_esc}\n\n"
+        f"{desc_esc}\n\n"
         f"{ch}"
         f"🏆 Победителей: {g['winners_count']}\n"
         f"⏳ Принимаем заявки до: {_format_ends_at_user(g['ends_at'])} (по Москве)"
@@ -2808,7 +2808,7 @@ async def _giveaway_dm_status_text_and_kb(
             tail = "✅ Условия выполнены."
         text = (
             f"<b>{title}</b>\n\n"
-            f"Приз: {desc}\n\n"
+            f"{desc}\n\n"
             f"{subscribe_block}"
             f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
             f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} Принимаем заявки до: {_format_ends_at_user(g['ends_at'])} (по Москве)\n\n"
@@ -2831,7 +2831,7 @@ async def _giveaway_dm_status_text_and_kb(
             )
         text = (
             f"<b>{title}</b>\n\n"
-            f"Приз: {desc}\n\n"
+            f"{desc}\n\n"
             f"{subscribe_block}"
             f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
             f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} Принимаем заявки до: {_format_ends_at_user(g['ends_at'])} (по Москве)\n"
@@ -3420,7 +3420,7 @@ async def _giveaway_public_caption(bot: Bot, g: dict[str, Any]) -> str:
         if desc_html:
             return (
                 f"🎰 {title_html}\n\n"
-                f"Приз: {desc_html}\n\n"
+                f"{desc_html}\n\n"
                 f"Количество билетов: <b>{tickets}</b>\n"
                 f"Победителей: <b>{g['winners_count']}</b>\n\n"
                 f"{hint}{winners_block}"
@@ -3429,7 +3429,7 @@ async def _giveaway_public_caption(bot: Bot, g: dict[str, Any]) -> str:
     winners_block = await _winners_block_html(bot, g) if g.get("status") == "finished" else ""
     return (
         f"{_tg_pe(_PE_GW_STEP1, '🎁')} {_restore_escaped_tg_emoji_html((g.get('title') or '').strip())}\n\n"
-        f"Приз: {_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
+        f"{_restore_escaped_tg_emoji_html(g.get('description') or '')}\n\n"
         f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
         f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
         f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
@@ -3461,7 +3461,7 @@ async def _giveaway_public_caption_safe(bot: Bot, g: dict[str, Any]) -> str:
         if desc_esc:
             return (
                 f"🎰 {title_esc}\n\n"
-                f"Приз: {desc_esc}\n\n"
+                f"{desc_esc}\n\n"
                 f"Количество билетов: <b>{tickets}</b>\n"
                 f"Победителей: <b>{g['winners_count']}</b>\n\n"
                 f"{hint}{winners_block}"
@@ -3472,7 +3472,7 @@ async def _giveaway_public_caption_safe(bot: Bot, g: dict[str, Any]) -> str:
     winners_block = await _winners_block_html(bot, g) if g.get("status") == "finished" else ""
     return (
         f"{_tg_pe(_PE_GW_STEP1, '🎁')} {title_esc}\n\n"
-        f"Приз: {desc_esc}\n\n"
+        f"{desc_esc}\n\n"
         f"{_tg_pe(_PE_POST_WINNERS, '🏆')} Победителей: {g['winners_count']}\n"
         f"{_tg_pe(_PE_POST_DEADLINE, '⏳')} До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
         f"{_tg_pe(_PE_POST_CTA, '🎯')} Жми «Участвовать» под этим постом и выполни все условия, "
@@ -3503,7 +3503,7 @@ def _giveaway_public_caption_plain(g: dict[str, Any]) -> str:
         winners_block = _winners_block_plain(g) if g.get("status") == "finished" else ""
         if desc:
             return _truncate_telegram_text(
-                f"🎰 {title}\n\nПриз: {desc}\n\n"
+                f"🎰 {title}\n\n{desc}\n\n"
                 f"Количество билетов: {tickets}\n"
                 f"Победителей: {g['winners_count']}\n\n"
                 f"{hint}{winners_block}",
@@ -3524,7 +3524,7 @@ def _giveaway_public_caption_plain(g: dict[str, Any]) -> str:
     ).strip()
     winners_block = _winners_block_plain(g) if g.get("status") == "finished" else ""
     body = (
-        f"🎁 {title}\n\nПриз: {desc}\n\n"
+        f"🎁 {title}\n\n{desc}\n\n"
         f"Победителей: {g['winners_count']}\n"
         f"До: {_format_ends_at_user(g['ends_at'])} (МСК)\n\n"
         f"Жми «Участвовать» под этим постом и выполни все условия, чтобы попасть в розыгрыш{winners_block}"
@@ -3551,6 +3551,19 @@ async def _edit_giveaway_public_message(
         use_entities = cts == "channel"
     except Exception:
         use_entities = False
+    # Для каналов редактируем текст через userbot, чтобы не терять premium emoji.
+    if use_entities:
+        edited_by_userbot = await _edit_via_userbot_if_possible(bot, g, chat_id, message_id, card)
+        if edited_by_userbot:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                log.debug("edit reply markup after userbot edit %s/%s: %s", chat_id, message_id, e)
+            return
     card_text, card_entities = _html_to_text_and_custom_entities(card)
     try:
         if kind == "photo" and fid:
@@ -3627,6 +3640,52 @@ async def _edit_giveaway_public_message(
                 )
     except TelegramBadRequest as e:
         log.debug("edit giveaway public msg %s/%s: %s", chat_id, message_id, e)
+
+
+async def _edit_via_userbot_if_possible(
+    bot: Bot, g: dict[str, Any], chat_id: int, message_id: int, text_html: str
+) -> bool:
+    ub = await _get_userbot_client()
+    if ub is None:
+        return False
+    try:
+        ch = await bot.get_chat(int(chat_id))
+    except Exception:
+        return False
+    if getattr(ch, "type", "") != "channel":
+        return False
+    target: Any = None
+    try:
+        target = await ub.get_input_entity(int(chat_id))
+    except Exception:
+        target = None
+    if target is None:
+        uname = (getattr(ch, "username", None) or "").strip()
+        if uname:
+            try:
+                target = await ub.get_input_entity(f"@{uname.lstrip('@')}")
+            except Exception:
+                target = None
+    if target is None:
+        try:
+            await ub.get_dialogs(limit=300)
+            target = await ub.get_input_entity(int(chat_id))
+        except Exception:
+            target = None
+    if target is None:
+        return False
+    try:
+        await ub.edit_message(
+            target,
+            int(message_id),
+            text_html,
+            parse_mode="html",
+            link_preview=False,
+        )
+        return True
+    except Exception as e:
+        log.debug("userbot edit failed %s/%s: %s", chat_id, message_id, e)
+        return False
 
 
 def _forum_send_kwargs(chat: Any) -> dict[str, Any]:
@@ -7548,7 +7607,7 @@ async def cb_lottery_pick(query: CallbackQuery, bot: Bot) -> None:
             (gid, uid, ticket_no, is_win, (_utc_now().isoformat() if is_win else None)),
         )
         cur_now = await db.execute(
-            "SELECT user_id FROM lottery_picks WHERE giveaway_id = ? AND is_winner = 1 ORDER BY won_at, id",
+            "SELECT user_id FROM lottery_picks WHERE giveaway_id = ? AND is_winner = 1 ORDER BY won_at, ticket_no",
             (gid,),
         )
         winners_now = [int(r["user_id"]) for r in await cur_now.fetchall()]
