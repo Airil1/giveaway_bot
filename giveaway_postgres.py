@@ -4667,12 +4667,15 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
                     )
                 text, kb = await _giveaway_dm_status_text_and_kb(bot, db, g, uid)
                 text_safe = await _sanitize_tg_emoji_html_for_send(bot, text)
-                # В этом entrypoint критичнее не уронить join-flow: отправляем как plain без parse_mode.
+                # В этом entrypoint критичнее не уронить join-flow:
+                # отправляем без parse_mode, но сохраняем premium emoji через entities.
+                dm_text, dm_entities = _html_to_text_and_custom_entities(text_safe)
                 sent = await bot.send_message(
                     uid,
-                    _html_to_plain_text_keep_linebreaks(text_safe),
+                    dm_text,
                     reply_markup=kb,
                     parse_mode=None,
+                    entities=dm_entities or None,
                     disable_web_page_preview=True,
                     link_preview_options=_LINK_PREVIEW_OFF,
                 )
