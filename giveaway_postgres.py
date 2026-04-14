@@ -1546,12 +1546,19 @@ def _channel_subscription_line_html(token: str) -> str:
 
 
 async def _channel_subscription_line_clickable_html(
-    bot: Bot, token: str, *, for_user_id: Optional[int] = None
+    bot: Bot,
+    token: str,
+    *,
+    for_user_id: Optional[int] = None,
+    invite_export_cache: Optional[dict[int, str]] = None,
 ) -> str:
     """Кликабельная строка подписки для личной карточки участника с реальным именем/ссылкой.
 
     Текст ссылки — название группы/канала (не голый t.me/+ в сообщении). for_user_id нужен только
     для запасного варианта, если export инвайта не удался и читатель ещё не в чате.
+
+    invite_export_cache: chat_id → URL из exportChatInviteLink. Один вызов export на чат за сообщение:
+    повторные вызовы отзывают предыдущую основную ссылку Telegram.
     """
     t = (token or "").strip()
     if not t:
@@ -1610,7 +1617,14 @@ async def _channel_subscription_line_clickable_html(
                 return f'• {kind_emoji} <a href="{safe_un}">{title}</a>'
             # Основная ссылка-приглашение от имени бота (админа) — не зависит от того, в группе ли читатель.
             try:
-                inv = await bot.export_chat_invite_link(chat.id)
+                cid_key = int(chat.id)
+                inv: Optional[str] = None
+                if invite_export_cache is not None and cid_key in invite_export_cache:
+                    inv = invite_export_cache[cid_key]
+                else:
+                    inv = await bot.export_chat_invite_link(chat.id)
+                    if inv and invite_export_cache is not None:
+                        invite_export_cache[cid_key] = inv
                 if inv:
                     code = ""
                     if "t.me/+" in inv.lower():
@@ -1666,11 +1680,17 @@ async def _channel_subscription_line_clickable_html(
 
 
 async def _missing_channels_links_inline_html(
-    bot: Bot, missing: list[str], *, for_user_id: Optional[int] = None
+    bot: Bot,
+    missing: list[str],
+    *,
+    for_user_id: Optional[int] = None,
+    invite_export_cache: Optional[dict[int, str]] = None,
 ) -> str:
     parts: list[str] = []
     for m in missing:
-        line = await _channel_subscription_line_clickable_html(bot, m, for_user_id=for_user_id)
+        line = await _channel_subscription_line_clickable_html(
+            bot, m, for_user_id=for_user_id, invite_export_cache=invite_export_cache
+        )
         if line.startswith("• "):
             line = line[2:]
         if line:
@@ -2882,6 +2902,22 @@ async def _giveaway_dm_status_text_and_kb(
     already = await cur.fetchone()
     channels = _channels_list(g["channels_json"])
     ok_sub, missing = await check_user_subscribed(bot, uid, channels)
+    # exportChatInviteLink каждый раз отзывает предыдущую основную ссылку — один кэш на всё сообщение.
+    invite_export_cache: dict[int, str] = {}
+    # Сначала блок «📣 Подпишись», потом «Подпишись на:» — один и тот же export по chat_id везде.
+    sub_lines: list[str] = []
+    for tok in channels:
+        sub_lines.append(
+            await _channel_subscription_line_clickable_html(
+                bot, tok, for_user_id=uid, invite_export_cache=invite_export_cache
+            )
+        )
+    sub_lines = [x for x in sub_lines if x]
+    subscribe_block = ""
+    if sub_lines:
+        subscribe_block = (
+            f"{_tg_pe(_PE_DM_SUBSCRIBE, '📣')} Подпишись:\n" + "\n".join(sub_lines) + "\n\n"
+        )
     parts: list[str] = []
     if g.get("require_username"):
         try:
@@ -2892,7 +2928,9 @@ async def _giveaway_dm_status_text_and_kb(
         if not has_un:
             parts.append("• Включи @username в профиле Telegram.")
     if not ok_sub:
-        miss = await _missing_channels_links_inline_html(bot, missing, for_user_id=uid)
+        miss = await _missing_channels_links_inline_html(
+            bot, missing, for_user_id=uid, invite_export_cache=invite_export_cache
+        )
         parts.append("• Подпишись на: " + (miss if miss else ", ".join(f"<code>{m}</code>" for m in missing)))
     status = "✅ Ты уже участвуешь в этом розыгрыше." if already else "Ты пока не участвуешь."
     cond = (
@@ -2925,18 +2963,6 @@ async def _giveaway_dm_status_text_and_kb(
     if not already:
         title = _restore_escaped_tg_emoji_html((g.get("title") or f"#{gid}").strip() or f"#{gid}")
         desc = _restore_escaped_tg_emoji_html(g.get("description") or "")
-        channels = _channels_list(g.get("channels_json") or "[]")
-        sub_lines: list[str] = []
-        for tok in channels:
-            sub_lines.append(
-                await _channel_subscription_line_clickable_html(bot, tok, for_user_id=uid)
-            )
-        sub_lines = [x for x in sub_lines if x]
-        subscribe_block = ""
-        if sub_lines:
-            subscribe_block = (
-                f"{_tg_pe(_PE_DM_SUBSCRIBE, '📣')} Подпишись:\n" + "\n".join(sub_lines) + "\n\n"
-            )
         if parts:
             tail = (
                 f"{_tg_pe(_PE_LOT_DOCWARN, 'ℹ️')} {status}\n"
@@ -2957,18 +2983,6 @@ async def _giveaway_dm_status_text_and_kb(
         # но без блока "Что нужно выполнить" — только подтверждение выполнения условий.
         title = _restore_escaped_tg_emoji_html((g.get("title") or f"#{gid}").strip() or f"#{gid}")
         desc = _restore_escaped_tg_emoji_html(g.get("description") or "")
-        channels = _channels_list(g.get("channels_json") or "[]")
-        sub_lines: list[str] = []
-        for tok in channels:
-            sub_lines.append(
-                await _channel_subscription_line_clickable_html(bot, tok, for_user_id=uid)
-            )
-        sub_lines = [x for x in sub_lines if x]
-        subscribe_block = ""
-        if sub_lines:
-            subscribe_block = (
-                f"{_tg_pe(_PE_DM_SUBSCRIBE, '📣')} Подпишись:\n" + "\n".join(sub_lines) + "\n\n"
-            )
         text = (
             f"<b>{title}</b>\n\n"
             f"{desc}\n\n"
@@ -5415,11 +5429,14 @@ async def cb_precheck(query: CallbackQuery, state: FSMContext, bot: Bot) -> None
         return
     channels = _channels_list(g["channels_json"])
     ok_sub, missing = await check_user_subscribed(bot, user.id, channels)
+    invite_export_cache: dict[int, str] = {}
     parts = []
     if g.get("require_username") and not (user.username):
         parts.append("• В настройках Telegram включи имя пользователя (@username).")
     if not ok_sub:
-        miss = await _missing_channels_links_inline_html(bot, missing, for_user_id=user.id)
+        miss = await _missing_channels_links_inline_html(
+            bot, missing, for_user_id=user.id, invite_export_cache=invite_export_cache
+        )
         parts.append("• Подпишись на: " + (miss if miss else ", ".join(f"<code>{m}</code>" for m in missing)))
     if parts:
         text = "⚠️ <b>Пока рано жать «Участвовать»</b>\n\n" + "\n".join(parts)
@@ -5466,6 +5483,7 @@ async def cb_join(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
 
         channels = _channels_list(g["channels_json"])
         ok_sub, missing = await check_user_subscribed(bot, uid, channels)
+        invite_export_cache: dict[int, str] = {}
         if g.get("require_username") and not user.username:
             await fail(
                 "⚠️ Нужен видимый @username в Telegram — включи в настройках профиля и попробуй ещё раз.",
@@ -5476,7 +5494,9 @@ async def cb_join(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
             miss_lines: list[str] = []
             for m in missing:
                 miss_lines.append(
-                    await _channel_subscription_line_clickable_html(bot, m, for_user_id=uid)
+                    await _channel_subscription_line_clickable_html(
+                        bot, m, for_user_id=uid, invite_export_cache=invite_export_cache
+                    )
                 )
             miss = "\n".join(x for x in miss_lines if x) or "\n".join(f"• <code>{m}</code>" for m in missing)
             await fail(
