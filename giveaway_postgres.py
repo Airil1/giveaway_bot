@@ -1514,8 +1514,15 @@ def _channel_subscription_line_html(token: str) -> str:
     return f"• @{html.escape(uname)}"
 
 
-async def _channel_subscription_line_clickable_html(bot: Bot, token: str) -> str:
-    """Кликабельная строка подписки для личной карточки участника с реальным именем/ссылкой."""
+async def _channel_subscription_line_clickable_html(
+    bot: Bot, token: str, *, for_user_id: Optional[int] = None
+) -> str:
+    """Кликабельная строка подписки для личной карточки участника с реальным именем/ссылкой.
+
+    for_user_id: если задан (личка участника), для приватных чатов без @username и без участия
+    пользователя показываем числовой id (-100…) и нейтральную подпись — без голого t.me/+ в тексте,
+    чтобы клиент Telegram не подставлял превью «ссылка истекла».
+    """
     t = (token or "").strip()
     if not t:
         return ""
@@ -1532,7 +1539,8 @@ async def _channel_subscription_line_clickable_html(bot: Bot, token: str) -> str
             code = url.split("t.me/joinchat/", 1)[1].split("?", 1)[0].strip("/")
         deep = f"tg://join?invite={code}" if code else url
         safe = html.escape(deep, quote=True)
-        label = html.escape(t, quote=False)
+        # Не показываем https://t.me/+… в видимом тексте — иначе превью ссылки в личке даёт «истекла».
+        label = html.escape("Приватный чат — нажми, чтобы вступить", quote=False)
         # Тип для invite-ссылки заранее не определить, используем нейтрально как "канал/группа".
         return f'• {ch_emoji} <a href="{safe}">{label}</a>'
     if t.startswith("@"):
@@ -1564,8 +1572,16 @@ async def _channel_subscription_line_clickable_html(bot: Bot, token: str) -> str
         if chat is not None:
             if getattr(chat, "type", "") in ("group", "supergroup"):
                 kind_emoji = gr_emoji
-            title = html.escape((chat.title or f"chat {t}"), quote=False)
+            ctype = getattr(chat, "type", "") or ""
             uname = (getattr(chat, "username", None) or "").strip()
+            if for_user_id is not None and not uname and ctype in ("channel", "group", "supergroup"):
+                if not await _user_member_of_chat(bot, int(chat.id), for_user_id):
+                    cid_s = html.escape(str(chat.id), quote=False)
+                    return (
+                        f"• {kind_emoji} приватный чат <code>{cid_s}</code> "
+                        f"<i>(вступи по ссылке из поста розыгрыша)</i>"
+                    )
+            title = html.escape((chat.title or f"chat {t}"), quote=False)
             if uname:
                 safe_un = html.escape(f"tg://resolve?domain={uname}", quote=True)
                 return f'• {kind_emoji} <a href="{safe_un}">{title}</a>'
@@ -1579,7 +1595,12 @@ async def _channel_subscription_line_clickable_html(bot: Bot, token: str) -> str
                         code = inv.split("t.me/joinchat/", 1)[1].split("?", 1)[0].strip("/")
                     deep_inv = f"tg://join?invite={code}" if code else inv
                     safe_inv = html.escape(deep_inv, quote=True)
-                    return f'• {kind_emoji} <a href="{safe_inv}">{title}</a>'
+                    inv_label = (
+                        html.escape("Вступить по ссылке", quote=False)
+                        if for_user_id is not None
+                        else title
+                    )
+                    return f'• {kind_emoji} <a href="{safe_inv}">{inv_label}</a>'
             except Exception:
                 pass
         return f"• {kind_emoji} <code>{html.escape(t, quote=False)}</code>"
@@ -1602,10 +1623,12 @@ async def _channel_subscription_line_clickable_html(bot: Bot, token: str) -> str
     return f"• {ch_emoji} <code>{html.escape(t, quote=False)}</code>"
 
 
-async def _missing_channels_links_inline_html(bot: Bot, missing: list[str]) -> str:
+async def _missing_channels_links_inline_html(
+    bot: Bot, missing: list[str], *, for_user_id: Optional[int] = None
+) -> str:
     parts: list[str] = []
     for m in missing:
-        line = await _channel_subscription_line_clickable_html(bot, m)
+        line = await _channel_subscription_line_clickable_html(bot, m, for_user_id=for_user_id)
         if line.startswith("• "):
             line = line[2:]
         if line:
@@ -1688,6 +1711,15 @@ async def _subscription_tokens_for_chat_ids(bot: Bot, chat_ids: list[int]) -> li
                 seen.add(tok)
                 tokens.append(tok)
     return tokens
+
+
+async def _user_member_of_chat(bot: Bot, chat_id: int, user_id: int) -> bool:
+    """True, если пользователь в чате (не вышел и не забанен)."""
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status not in ("left", "kicked")
+    except Exception:
+        return False
 
 
 async def check_user_subscribed(bot: Bot, user_id: int, channels: list[str]) -> tuple[bool, list[str]]:
@@ -2818,7 +2850,7 @@ async def _giveaway_dm_status_text_and_kb(
         if not has_un:
             parts.append("• Включи @username в профиле Telegram.")
     if not ok_sub:
-        miss = await _missing_channels_links_inline_html(bot, missing)
+        miss = await _missing_channels_links_inline_html(bot, missing, for_user_id=uid)
         parts.append("• Подпишись на: " + (miss if miss else ", ".join(f"<code>{m}</code>" for m in missing)))
     status = "✅ Ты уже участвуешь в этом розыгрыше." if already else "Ты пока не участвуешь."
     cond = (
@@ -2854,7 +2886,9 @@ async def _giveaway_dm_status_text_and_kb(
         channels = _channels_list(g.get("channels_json") or "[]")
         sub_lines: list[str] = []
         for tok in channels:
-            sub_lines.append(await _channel_subscription_line_clickable_html(bot, tok))
+            sub_lines.append(
+                await _channel_subscription_line_clickable_html(bot, tok, for_user_id=uid)
+            )
         sub_lines = [x for x in sub_lines if x]
         subscribe_block = ""
         if sub_lines:
@@ -2884,7 +2918,9 @@ async def _giveaway_dm_status_text_and_kb(
         channels = _channels_list(g.get("channels_json") or "[]")
         sub_lines: list[str] = []
         for tok in channels:
-            sub_lines.append(await _channel_subscription_line_clickable_html(bot, tok))
+            sub_lines.append(
+                await _channel_subscription_line_clickable_html(bot, tok, for_user_id=uid)
+            )
         sub_lines = [x for x in sub_lines if x]
         subscribe_block = ""
         if sub_lines:
@@ -4369,6 +4405,14 @@ def _kb_back_admin_giveaway(gid: int) -> InlineKeyboardMarkup:
     )
 
 
+def _plist_kb(gid: int, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if total_pages > 1:
+        rows.append([*_pager_row(f"plist:{gid}", page, total_pages)])
+    rows.append([_ikb_back(f"ag:{gid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _list_giveaways_kb(items: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for g in items[:20]:
@@ -4423,6 +4467,7 @@ def _my_joined_list_kb(own_items: list[dict[str, Any]], joined_items: list[dict[
 
 
 _MY_PAGE_SIZE = 5
+_PLIST_PAGE_SIZE = 10
 
 
 def _page_bounds(total: int, page: int, page_size: int = _MY_PAGE_SIZE) -> tuple[int, int, int]:
@@ -4511,6 +4556,8 @@ async def _edit_screen(
             "chat_id": chat_id,
             "message_id": message_id,
             "reply_markup": kb,
+            "disable_web_page_preview": True,
+            "link_preview_options": _LINK_PREVIEW_OFF,
         }
         if parse_mode is not None:
             kw["parse_mode"] = parse_mode
@@ -4585,7 +4632,14 @@ async def _render_callback_screen(
         await bot.delete_message(cid, mid)
     except Exception as e:
         log.debug("replace screen delete old msg: %s", e)
-    sent = await bot.send_message(cid, text, reply_markup=kb, parse_mode="HTML")
+    sent = await bot.send_message(
+        cid,
+        text,
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        link_preview_options=_LINK_PREVIEW_OFF,
+    )
     await _remember_ui(state, sent.chat.id, sent.message_id)
 
 
@@ -5323,7 +5377,7 @@ async def cb_precheck(query: CallbackQuery, state: FSMContext, bot: Bot) -> None
     if g.get("require_username") and not (user.username):
         parts.append("• В настройках Telegram включи имя пользователя (@username).")
     if not ok_sub:
-        miss = await _missing_channels_links_inline_html(bot, missing)
+        miss = await _missing_channels_links_inline_html(bot, missing, for_user_id=user.id)
         parts.append("• Подпишись на: " + (miss if miss else ", ".join(f"<code>{m}</code>" for m in missing)))
     if parts:
         text = "⚠️ <b>Пока рано жать «Участвовать»</b>\n\n" + "\n".join(parts)
@@ -5379,7 +5433,9 @@ async def cb_join(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         if not ok_sub:
             miss_lines: list[str] = []
             for m in missing:
-                miss_lines.append(await _channel_subscription_line_clickable_html(bot, m))
+                miss_lines.append(
+                    await _channel_subscription_line_clickable_html(bot, m, for_user_id=uid)
+                )
             miss = "\n".join(x for x in miss_lines if x) or "\n".join(f"• <code>{m}</code>" for m in missing)
             await fail(
                 f"{_tg_pe(_PE_DM_SUBSCRIBE, '📣')} Сначала подпишись сюда:\n{miss}",
@@ -8216,42 +8272,64 @@ async def cb_plist(query: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     if not query.from_user:
         await query.answer()
         return
-    uid = query.from_user.id
-    gid = int(query.data.split(":")[1])
+    owner_id = query.from_user.id
+    parts = (query.data or "").split(":")
+    if len(parts) < 2:
+        await query.answer()
+        return
+    gid = int(parts[1])
+    page = 1
+    if ":p:" in (query.data or ""):
+        try:
+            page = int(query.data.rsplit(":p:", 1)[-1])
+        except Exception:
+            page = 1
     back = _kb_back_admin_giveaway(gid)
     async with _pg_conn() as db:
         g = await get_giveaway(db, gid)
-        cur = await db.execute(
-            "SELECT user_id, username, first_name FROM participants WHERE giveaway_id = ? ORDER BY joined_at",
+        cur_cnt = await db.execute(
+            "SELECT COUNT(*) AS cnt FROM participants WHERE giveaway_id = ?",
             (gid,),
+        )
+        total = int((await cur_cnt.fetchone())["cnt"])
+        cur_page, total_pages, start = _page_bounds(total, page, _PLIST_PAGE_SIZE)
+        cur = await db.execute(
+            "SELECT user_id, username, first_name FROM participants WHERE giveaway_id = ? "
+            "ORDER BY joined_at LIMIT ? OFFSET ?",
+            (gid, _PLIST_PAGE_SIZE, start),
         )
         rows = await cur.fetchall()
     if not g:
         await _render_callback_screen(query, state, bot, "❌ Розыгрыш не найден.", back)
         return
-    if not _is_giveaway_owner(g, uid):
+    if not _is_giveaway_owner(g, owner_id):
         await query.answer("Список видит только автор розыгрыша", show_alert=True)
         return
     channels = _channels_list(g["channels_json"])
     lines_out: list[str] = []
     for row in rows:
-        uid = int(row["user_id"])
-        ok, _ = await check_user_subscribed(bot, uid, channels)
+        part_uid = int(row["user_id"])
+        ok, _ = await check_user_subscribed(bot, part_uid, channels)
         un = row["username"] or ""
         mark = "✅" if ok else "⚠️ подписки нет"
-        line = f"{mark} <code>{uid}</code> @{un} {row['first_name'] or ''}"
+        line = f"{mark} <code>{part_uid}</code> @{un} {row['first_name'] or ''}"
         lines_out.append(line)
+    kb = _plist_kb(gid, cur_page, total_pages)
     if not lines_out:
-        await _render_callback_screen(
-            query, state, bot, f"📋 <b>Участники #{gid}</b>\n\nПока тихо — никто не нажал «Участвовать».", back
+        header = (
+            f"📋 <b>Участники #{gid}</b>\n"
+            f"👥 Всего: <b>{total}</b>\n\n"
+            "Пока тихо — никто не нажал «Участвовать»."
         )
+        await _render_callback_screen(query, state, bot, header, kb)
         return
     body = "\n".join(lines_out)
-    header = f"📋 <b>Участники #{gid}</b>\n\n"
+    page_note = f"Страница <b>{cur_page}</b> из <b>{total_pages}</b>.\n\n" if total_pages > 1 else ""
+    header = f"📋 <b>Участники #{gid}</b>\n👥 Всего: <b>{total}</b>\n{page_note}"
     max_body = 4096 - len(header) - 40
     if len(body) > max_body:
         body = body[:max_body] + "\n\n<i>дальше не влезло</i>"
-    await _render_callback_screen(query, state, bot, header + body, back)
+    await _render_callback_screen(query, state, bot, header + body, kb)
 
 
 @router.callback_query(F.data.startswith("repost:"))
