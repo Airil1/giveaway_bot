@@ -492,6 +492,37 @@ def _invite_link_hash(text: str) -> Optional[str]:
     return code or None
 
 
+async def _invite_link_display_title(invite_text: str) -> Optional[str]:
+    """Название чата по инвайт-ссылке: только CheckChatInvite (userbot), без Import/join."""
+    h = _invite_link_hash(invite_text)
+    if not h or not _userbot_configured():
+        return None
+    ub = await _get_userbot_client()
+    if ub is None:
+        return None
+    try:
+        from telethon.errors import InviteHashExpiredError, InviteHashInvalidError
+        from telethon.tl.functions.messages import CheckChatInviteRequest
+    except ImportError:
+        return None
+    try:
+        checked = await ub(CheckChatInviteRequest(h))
+        t = getattr(checked, "title", None)
+        if isinstance(t, str) and t.strip():
+            return t.strip()
+        ch = getattr(checked, "chat", None)
+        if ch is not None:
+            ct = getattr(ch, "title", None)
+            if isinstance(ct, str) and ct.strip():
+                return ct.strip()
+    except (InviteHashExpiredError, InviteHashInvalidError):
+        return None
+    except Exception as e:
+        log.debug("invite title CheckChatInvite: %s", e)
+        return None
+    return None
+
+
 def _forwarded_chat_id(message: Message) -> Optional[int]:
     """Извлекает chat_id из пересланного сообщения (старый и новый форматы Telegram)."""
     sc = getattr(message, "sender_chat", None)
@@ -1519,9 +1550,8 @@ async def _channel_subscription_line_clickable_html(
 ) -> str:
     """Кликабельная строка подписки для личной карточки участника с реальным именем/ссылкой.
 
-    for_user_id: если задан (личка участника), для приватных чатов без @username и без участия
-    пользователя показываем числовой id (-100…) и нейтральную подпись — без голого t.me/+ в тексте,
-    чтобы клиент Telegram не подставлял превью «ссылка истекла».
+    Текст ссылки — название группы/канала (не голый t.me/+ в сообщении). for_user_id нужен только
+    для запасного варианта, если export инвайта не удался и читатель ещё не в чате.
     """
     t = (token or "").strip()
     if not t:
@@ -1539,9 +1569,8 @@ async def _channel_subscription_line_clickable_html(
             code = url.split("t.me/joinchat/", 1)[1].split("?", 1)[0].strip("/")
         deep = f"tg://join?invite={code}" if code else url
         safe = html.escape(deep, quote=True)
-        # Не показываем https://t.me/+… в видимом тексте — иначе превью ссылки в личке даёт «истекла».
-        label = html.escape("Приватный чат — нажми, чтобы вступить", quote=False)
-        # Тип для invite-ссылки заранее не определить, используем нейтрально как "канал/группа".
+        name = await _invite_link_display_title(t)
+        label = html.escape((name or "Приватный чат").strip(), quote=False)
         return f'• {ch_emoji} <a href="{safe}">{label}</a>'
     if t.startswith("@"):
         uname = t[1:].strip()
@@ -1574,17 +1603,12 @@ async def _channel_subscription_line_clickable_html(
                 kind_emoji = gr_emoji
             ctype = getattr(chat, "type", "") or ""
             uname = (getattr(chat, "username", None) or "").strip()
-            if for_user_id is not None and not uname and ctype in ("channel", "group", "supergroup"):
-                if not await _user_member_of_chat(bot, int(chat.id), for_user_id):
-                    cid_s = html.escape(str(chat.id), quote=False)
-                    return (
-                        f"• {kind_emoji} приватный чат <code>{cid_s}</code> "
-                        f"<i>(вступи по ссылке из поста розыгрыша)</i>"
-                    )
-            title = html.escape((chat.title or f"chat {t}"), quote=False)
+            title_plain = (chat.title or f"chat {t}") or f"chat {t}"
+            title = html.escape(title_plain, quote=False)
             if uname:
                 safe_un = html.escape(f"tg://resolve?domain={uname}", quote=True)
                 return f'• {kind_emoji} <a href="{safe_un}">{title}</a>'
+            # Основная ссылка-приглашение от имени бота (админа) — не зависит от того, в группе ли читатель.
             try:
                 inv = await bot.export_chat_invite_link(chat.id)
                 if inv:
@@ -1595,14 +1619,19 @@ async def _channel_subscription_line_clickable_html(
                         code = inv.split("t.me/joinchat/", 1)[1].split("?", 1)[0].strip("/")
                     deep_inv = f"tg://join?invite={code}" if code else inv
                     safe_inv = html.escape(deep_inv, quote=True)
-                    inv_label = (
-                        html.escape("Вступить по ссылке", quote=False)
-                        if for_user_id is not None
-                        else title
-                    )
-                    return f'• {kind_emoji} <a href="{safe_inv}">{inv_label}</a>'
+                    return f'• {kind_emoji} <a href="{safe_inv}">{title}</a>'
             except Exception:
                 pass
+            if (
+                for_user_id is not None
+                and ctype in ("channel", "group", "supergroup")
+                and not await _user_member_of_chat(bot, int(chat.id), for_user_id)
+            ):
+                cid_s = html.escape(str(chat.id), quote=False)
+                return (
+                    f"• {kind_emoji} приватный чат <code>{cid_s}</code> "
+                    f"<i>(вступи по ссылке из поста розыгрыша — бот не смог выдать инвайт)</i>"
+                )
         return f"• {kind_emoji} <code>{html.escape(t, quote=False)}</code>"
     safe_t = html.escape(t, quote=True)
     if t.startswith("http://") or t.startswith("https://"):
