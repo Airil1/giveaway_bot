@@ -5724,12 +5724,24 @@ def _winner_link_label_html(raw: str, user_id: int) -> str:
     return html.escape(s, quote=True)
 
 
+def _is_valid_public_tg_username(un: str) -> bool:
+    u = (un or "").strip().lstrip("@")
+    return bool(u) and bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", u))
+
+
 async def _format_winners_lines_html(
     bot: Bot,
     giveaway_id: int,
     winner_ids: list[int],
+    *,
+    for_creator_dm: bool = False,
 ) -> str:
-    """Список победителей HTML: кликабельное имя (ссылка tg://user), без @username в подписи."""
+    """Список победителей HTML: кликабельное имя.
+
+    В постах канала — tg://user и отображаемое имя (без @username в тексте).
+    В личку создателю — при наличии @username ссылка https://t.me/… (в личке с ботом кликабельнее),
+    иначе как в посте.
+    """
     lines: list[str] = []
     async with _pg_conn() as db:
         for i, wid in enumerate(winner_ids, 1):
@@ -5738,16 +5750,32 @@ async def _format_winners_lines_html(
             except (TypeError, ValueError):
                 continue
             label = ""
+            uname = ""
             cur = await db.execute(
                 "SELECT username, first_name FROM participants WHERE giveaway_id = ? AND user_id = ?",
                 (giveaway_id, wid_int),
             )
             row = await cur.fetchone()
             if row:
+                uname = (row["username"] or "").strip().lstrip("@")
                 fn = (row["first_name"] or "").strip()
                 if fn:
                     label = fn
-            if not label:
+            if for_creator_dm and not _is_valid_public_tg_username(uname):
+                try:
+                    ch = await bot.get_chat(wid_int)
+                    cu = (getattr(ch, "username", None) or "").strip().lstrip("@")
+                    if _is_valid_public_tg_username(cu):
+                        uname = cu
+                    if not label:
+                        label = (
+                            " ".join(
+                                x for x in (ch.first_name or "", ch.last_name or "") if x
+                            ).strip()
+                        )
+                except Exception:
+                    pass
+            elif not label:
                 try:
                     ch = await bot.get_chat(wid_int)
                     label = (
@@ -5757,6 +5785,11 @@ async def _format_winners_lines_html(
                     )
                 except Exception:
                     pass
+            if for_creator_dm and _is_valid_public_tg_username(uname):
+                href = html.escape(f"https://t.me/{uname}", quote=True)
+                lab = html.escape("@" + uname, quote=True)
+                lines.append(f'{i}. <a href="{href}">{lab}</a>')
+                continue
             safe = _winner_link_label_html(label, wid_int)
             lines.append(f'{i}. <a href="tg://user?id={wid_int}">{safe}</a>')
     return "\n".join(lines)
@@ -5766,20 +5799,24 @@ async def _notify_participants_finished(
     bot: Bot, g: dict[str, Any], winners: list[int]
 ) -> None:
     gid = int(g.get("id") or 0)
-    title = _restore_escaped_tg_emoji_html((g.get("title") or f"#{gid}").strip() or f"#{gid}")
+    # Не вставляем title из БД как «сырой» HTML внутрь <b> — иначе ломается разбор и ссылки ниже.
+    title_plain = _user_stored_html_as_safe_plain_escape(
+        (g.get("title") or f"#{gid}").strip() or f"#{gid}",
+        max_len=400,
+    )
     creator_id = int(g.get("created_by") or 0)
 
     # 1) Создателю возвращаем прежнее детальное уведомление.
     if creator_id > 0:
         if winners:
-            body = await _format_winners_lines_html(bot, gid, winners)
+            body = await _format_winners_lines_html(bot, gid, winners, for_creator_dm=True)
             creator_text = (
-                f"🏁 <b>{title}</b> — розыгрыш завершён.\n\n"
+                f"🏁 <b>{title_plain}</b> — розыгрыш завершён.\n\n"
                 f"Победители:\n{body}"
             )
         else:
             creator_text = (
-                f"🏁 <b>{title}</b> — розыгрыш завершён.\n\n"
+                f"🏁 <b>{title_plain}</b> — розыгрыш завершён.\n\n"
                 "Победителей нет: никто не подошёл по условиям или не участвовал."
             )
         try:
